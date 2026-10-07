@@ -31,6 +31,10 @@ st.set_page_config(
 
 SEED = 42
 
+# Katalog repozytorium, w którym znajduje się Kod.py.
+# Na Streamlit Cloud jest to katalog checkoutu repozytorium.
+APP_DIR = Path(__file__).resolve().parent
+
 PRZECIETNE_WYNAGRODZENIE_PL = {
     1999: 1706.74, 2000: 1923.81, 2001: 2061.85, 2002: 2133.21,
     2003: 2201.47, 2004: 2289.57, 2005: 2380.29, 2006: 2477.23,
