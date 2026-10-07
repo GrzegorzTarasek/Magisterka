@@ -32,7 +32,7 @@ SEED = 42
 APP_DIR = Path(__file__).resolve().parent
 
 # ============================================================
-# 1. SERIE STAŁE I MAPOWANIE TERYT
+# 1. PARAMETRY DANYCH
 # ============================================================
 
 MIN_WAGE_PL = {
@@ -40,17 +40,6 @@ MIN_WAGE_PL = {
     2015: 1750, 2016: 1850, 2017: 2000, 2018: 2100, 2019: 2250,
     2020: 2600, 2021: 2800, 2022: 3010, 2023: 3490, 2024: 4242,
     2025: 4666,
-}
-
-# Zachowana jako seria referencyjna/awaryjna. Nie jest używana do regionalnego Kaitza.
-PRZECIETNE_WYNAGRODZENIE_PL = {
-    1999: 1706.74, 2000: 1923.81, 2001: 2061.85, 2002: 2133.21,
-    2003: 2201.47, 2004: 2289.57, 2005: 2380.29, 2006: 2477.23,
-    2007: 2691.03, 2008: 2943.88, 2009: 3102.96, 2010: 3224.98,
-    2011: 3399.52, 2012: 3521.67, 2013: 3650.06, 2014: 3783.46,
-    2015: 3899.78, 2016: 4047.21, 2017: 4271.51, 2018: 4585.03,
-    2019: 4918.17, 2020: 5167.47, 2021: 5662.53, 2022: 6346.15,
-    2023: 7155.48, 2024: 8181.72, 2025: 8903.56,
 }
 
 WOJEWODZTWA_MAP = {
@@ -72,10 +61,8 @@ WOJEWODZTWA_MAP = {
     "32": "Zachodniopomorskie",
 }
 
-# ============================================================
-# 2. PLIKI – WSZYSTKO Z REPO, ZERO UPLOADU
-# ============================================================
-
+# Tylko dane faktycznie potrzebne do głównej analizy.
+# Pozostałe pliki z repo mogą istnieć, ale nie są wymagane.
 REPOSITORY_FILES = {
     "RYNE_UNEMPLOYMENT": "RYNE_4100_CTAB_20261006234212.csv",
     "RYNE_EMPLOYMENT": "RYNE_4112_CTAB_20261006234336.csv",
@@ -85,6 +72,20 @@ REPOSITORY_FILES = {
     "RACH_PRODUCTIVITY": "RACH_3510_XTAB_20261007010935.xlsx",
 }
 
+CORE_SOURCE_LABELS = {
+    "RYNE_UNEMPLOYMENT": "RYNE 4100 – stopa bezrobocia BAEL",
+    "RYNE_EMPLOYMENT": "RYNE 4112 – wskaźnik zatrudnienia BAEL",
+    "WYNA_REGIONAL": "WYNA 2504 – przeciętne wynagrodzenie regionalne",
+    "RACH_GDP_GROWTH": "RACH 3502 – dynamika realnego PKB",
+    "RACH_GVA_SECTOR": "RACH 3505 – WDB wg sektorów",
+    "RACH_PRODUCTIVITY": "RACH 3510 – WDB na 1 pracującego",
+}
+
+
+# ============================================================
+# 2. PLIKI Z REPOZYTORIUM – ZERO UPLOADU
+# ============================================================
+
 
 def detect_file(key):
     expected = REPOSITORY_FILES[key]
@@ -92,25 +93,20 @@ def detect_file(key):
     if exact.exists():
         return exact
 
-    prefix = expected.split("_")[0].upper()
-    ident = expected.split("_")[1].upper() if "_" in expected else ""
-
-    try:
-        candidates = sorted(
-            p for p in APP_DIR.iterdir()
-            if p.is_file() and p.name.upper().startswith(prefix)
-        )
-    except Exception:
-        candidates = []
-
-    for p in candidates:
-        if ident and f"_{ident}_" in p.name.upper():
-            return p
+    # Fallback jest ograniczony do konkretnego identyfikatora tabeli,
+    # np. RACH_3502_, a nie wszystkich plików RACH_.
+    stem_match = "_".join(expected.split("_")[:2]).upper() + "_"
+    candidates = sorted(
+        p for p in APP_DIR.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}
+        and p.name.upper().startswith(stem_match)
+    )
     return candidates[-1] if candidates else None
 
 
 # ============================================================
-# 3. NARZĘDZIA TEKSTOWE / TERYT / LICZBY
+# 3. NARZĘDZIA
 # ============================================================
 
 
@@ -137,205 +133,214 @@ def numeric_series(series):
     return pd.to_numeric(series, errors="coerce")
 
 
-def looks_like_teryt(value):
-    if pd.isna(value):
-        return False
-    digits = re.sub(r"\D", "", normalize_text(value))
-    return len(digits) >= 7 and digits[:2] in WOJEWODZTWA_MAP
-
-
-def extract_teryt(value):
-    digits = re.sub(r"\D", "", normalize_text(value))
-    if not digits:
-        return np.nan
-    digits = digits.zfill(7)
-    prefix = digits[:2]
-    return prefix if prefix in WOJEWODZTWA_MAP else np.nan
-
-
 def year_from_text(value):
     text = normalize_text(value)
     match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", text)
     return int(match.group(1)) if match else None
 
 
-def col_has_year(col, year):
-    return year_from_text(col) == int(year) or bool(
-        re.search(rf"(?<!\d){int(year)}(?!\d)", normalize_text(col))
+def get_years_from_columns(columns):
+    return sorted({
+        year_from_text(c)
+        for c in columns
+        if year_from_text(c) is not None and 1900 <= year_from_text(c) <= 2100
+    })
+
+
+REGION_NAME_TO_CODE = {normalize_low(name): code for code, name in WOJEWODZTWA_MAP.items()}
+
+def extract_teryt(value):
+    if pd.isna(value):
+        return np.nan
+    text = normalize_text(value)
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return np.nan
+    # GUS/Excel can remove a leading zero from a 7-digit TERYT code.
+    # Handle common representations explicitly.
+    if len(digits) == 2 and digits in WOJEWODZTWA_MAP:
+        return digits
+    if len(digits) >= 7:
+        candidate = digits[:2]
+        if candidate in WOJEWODZTWA_MAP:
+            return candidate
+    if len(digits) == 6 and ("0" + digits[:1]) in WOJEWODZTWA_MAP:
+        return "0" + digits[:1]
+    # A six/seven digit numeric code with a lost leading zero is ambiguous;
+    # resolve it later from the regional name whenever possible.
+    if len(digits) == 6:
+        candidate = digits[:2]
+        if candidate in WOJEWODZTWA_MAP:
+            return candidate
+    return np.nan
+
+def code_from_region_name(value):
+    text = normalize_low(value)
+    if not text:
+        return np.nan
+    text = re.sub(r"^województwo\s+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return REGION_NAME_TO_CODE.get(text, np.nan)
+
+def is_region_code(value):
+    return pd.notna(extract_teryt(value))
+
+
+def normalize_region_name(value):
+    text = normalize_low(value)
+    if not text:
+        return np.nan
+    text = re.sub(r"^województwo\s+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    code = REGION_NAME_TO_CODE.get(text)
+    return WOJEWODZTWA_MAP.get(code, np.nan)
+
+
+def add_region_key(df):
+    out = df.copy()
+    if "Kod" not in out.columns:
+        raise ValueError("Brak kolumny Kod w tabeli GUS.")
+
+    code_from_name = (
+        out["Nazwa"].map(code_from_region_name)
+        if "Nazwa" in out.columns
+        else pd.Series(np.nan, index=out.index)
     )
+    code_from_code = out["Kod"].map(extract_teryt)
+
+    # Nazwa jest używana jako pierwszy klucz, bo Excel potrafi usunąć
+    # początkowe zero z 7-cyfrowego kodu TERYT.
+    out["Kod"] = code_from_name.fillna(code_from_code)
+    out["Kod"] = out["Kod"].astype("object")
+    out["Wojewodztwo"] = out["Kod"].map(WOJEWODZTWA_MAP)
+
+    if "Nazwa" in out.columns:
+        fallback_name = out["Nazwa"].map(normalize_region_name)
+        out["Wojewodztwo"] = out["Wojewodztwo"].fillna(fallback_name)
+
+    return out
+
+
+def col_has_year(col, year):
+    return bool(re.search(rf"(?<!\d){int(year)}(?!\d)", normalize_text(col)))
+
+
+def clean_key_panel(df):
+    out = add_region_key(df.copy())
+    if "Rok" not in out.columns:
+        raise ValueError("Brak kolumny Rok po odczytaniu tabeli GUS.")
+    out["Rok"] = pd.to_numeric(out["Rok"], errors="coerce")
+    out = out.dropna(subset=["Wojewodztwo", "Rok"]).copy()
+    out["Rok"] = out["Rok"].astype(int)
+    out["Kod"] = out["Wojewodztwo"].map({v: k for k, v in WOJEWODZTWA_MAP.items()})
+    return out.drop_duplicates(["Wojewodztwo", "Rok"])
 
 
 # ============================================================
-# 4. ROBUSTNY ODCZYT GUS XLSX
+# 4. ODCZYT GUS XLSX – WIELOWIERSZOWE NAGŁÓWKI
 # ============================================================
 
 
-def find_code_name_row(raw, scan_limit=100):
-    limit = min(len(raw), scan_limit)
-    for i in range(limit):
-        row = [normalize_low(v) for v in raw.iloc[i].tolist()]
-        has_kod = any(v == "kod" or v.startswith("kod ") for v in row)
-        has_nazwa = any(v == "nazwa" or v.startswith("nazwa ") for v in row)
-        if has_kod and has_nazwa:
+def find_code_row(raw):
+    for i in range(min(len(raw), 120)):
+        values = [normalize_low(v) for v in raw.iloc[i].tolist()]
+        has_code = any(v == "kod" or v.startswith("kod ") for v in values)
+        has_name = any(v == "nazwa" or v.startswith("nazwa ") for v in values)
+        if has_code and has_name:
             return i
     return None
 
 
-def find_data_start(raw, code_name_row, scan_limit=40):
-    start = code_name_row + 1
-    stop = min(len(raw), start + scan_limit)
-    for i in range(start, stop):
-        first = raw.iloc[i, 0] if raw.shape[1] else None
-        second = raw.iloc[i, 1] if raw.shape[1] > 1 else None
-        if looks_like_teryt(first) and normalize_text(second):
+def find_data_start(raw, code_row):
+    for i in range(code_row + 1, min(len(raw), code_row + 50)):
+        if raw.shape[1] < 2:
+            continue
+        if is_region_code(raw.iat[i, 0]) and normalize_text(raw.iat[i, 1]):
             return i
-    return start
+    return code_row + 1
 
 
-def _fill_merged_headers(header):
-    h = header.copy()
-    h = h.map(normalize_text)
-    h = h.replace("", np.nan)
-    # Najpierw poziomo – obsługa scalonych komórek grupy.
-    h = h.ffill(axis=1)
-    # Potem pionowo – obsługa opisów trwających przez kilka wierszy.
-    h = h.ffill(axis=0)
-    return h
-
-
-def detect_year_row(raw, start_row, end_row):
-    """Znajduje w obszarze nagłówka wiersz, w którym zapisano lata."""
-    best = None
-    for i in range(max(0, start_row), min(end_row, len(raw))):
-        years = []
-        for j in range(raw.shape[1]):
-            y = year_from_text(raw.iat[i, j])
-            if y is not None and 1900 <= y <= 2100:
-                years.append((j, y))
-        distinct = len(set(y for _, y in years))
-        if len(years) >= 3 and distinct >= 3:
-            score = len(years) + 2 * distinct
-            if best is None or score > best[0]:
-                best = (score, i, years)
-    return best[1:] if best else (None, [])
-
-
-def add_years_from_row(year_row_values, ncols):
-    mapping = [None] * ncols
-    current = None
-    for j in range(ncols):
-        val = year_row_values[j] if j < len(year_row_values) else None
-        y = year_from_text(val)
-        if y is not None:
-            current = y
-        mapping[j] = current
-    return mapping
-
-
-def build_flat_gus_columns(raw, code_name_row, data_start):
-    """Spłaszcza nietypowe, wielowierszowe nagłówki GUS.
-
-    Kluczowa poprawka względem poprzedniej wersji: lata mogą znajdować się
-    w osobnym wierszu lub nawet przed wierszem Kod/Nazwa. Są wykrywane
-    niezależnie i dopisywane do każdej kolumny.
-    """
-    header_start = max(0, code_name_row - 12)
-    header_end = data_start
-    header = raw.iloc[header_start:header_end].copy()
-
+def build_xlsx_headers(raw, code_row, data_start):
+    # Bierzemy kilkanaście wierszy powyżej tabeli, ponieważ GUS ma różne
+    # warianty nagłówków. W osobnym wierszu najczęściej zapisane są lata.
+    start = max(0, code_row - 15)
+    header = raw.iloc[start:data_start].copy()
     if header.empty:
         return [f"col_{j}" for j in range(raw.shape[1])]
 
-    # Wersja wypełniona do rozpoznawania opisów grup.
-    filled = _fill_merged_headers(header)
-
-    # Szukamy osobnego wiersza z latami w całym obszarze nagłówka.
-    year_row_idx, year_pairs = detect_year_row(raw, header_start, header_end)
+    # Lata odczytujemy przed ffill, żeby nie zgubić początku kolejnych grup.
     year_map = [None] * raw.shape[1]
-    if year_row_idx is not None:
-        raw_year_row = [raw.iat[year_row_idx, j] for j in range(raw.shape[1])]
-        year_map = add_years_from_row(raw_year_row, raw.shape[1])
+    for j in range(raw.shape[1]):
+        found = []
+        for i in range(header.shape[0]):
+            y = year_from_text(header.iat[i, j])
+            if y is not None and 1900 <= y <= 2100:
+                found.append(y)
+        if found:
+            # Ostatni jawnie zapisany rok w danej kolumnie.
+            year_map[j] = found[-1]
+
+    # Opisy grup bywają zapisane tylko w pierwszej kolumnie grupy.
+    labels = header.map(normalize_text).replace("", np.nan).ffill(axis=1).ffill(axis=0)
 
     columns = []
     used = set()
-
     for j in range(raw.shape[1]):
-        parts = []
-
-        # Wszystkie sensowne wartości z nagłówka dla kolumny.
-        for i in range(filled.shape[0]):
-            value = filled.iat[i, j]
-            if pd.isna(value):
-                continue
-            value = normalize_text(value)
-            if not value:
-                continue
-            if value in {"Kod", "Nazwa"}:
-                continue
-            if value not in parts:
-                parts.append(value)
-
-        # Jeżeli osobny wiersz roku nie trafił do joinu, dodajemy go jawnie.
-        if year_map[j] is not None:
-            y_text = str(year_map[j])
-            if y_text not in parts:
-                parts.append(y_text)
-
-        if any(normalize_low(p) == "kod" for p in [raw.iat[code_name_row, j]]):
-            name = "Kod"
-        elif any(normalize_low(p) == "nazwa" for p in [raw.iat[code_name_row, j]]):
-            name = "Nazwa"
-        else:
-            name = " | ".join(parts).strip()
-            if not name:
-                name = f"col_{j}"
-
-        # Kod/Nazwa mogą zostać rozpoznane jako kolumny bezpośrednio z wiersza.
-        direct = normalize_low(raw.iat[code_name_row, j])
+        direct = normalize_low(raw.iat[code_row, j])
         if direct == "kod" or direct.startswith("kod "):
             name = "Kod"
         elif direct == "nazwa" or direct.startswith("nazwa "):
             name = "Nazwa"
+        else:
+            parts = []
+            for i in range(labels.shape[0]):
+                val = normalize_text(labels.iat[i, j])
+                if not val or val.lower() in {"kod", "nazwa"}:
+                    continue
+                if year_from_text(val) is not None:
+                    continue
+                if val not in parts:
+                    parts.append(val)
+            if year_map[j] is not None:
+                parts.append(str(year_map[j]))
+            name = " | ".join(parts)
+            if not name:
+                name = f"col_{j}"
 
-        base_name = name
-        k = 1
+        base = name
+        n = 2
         while name in used:
-            k += 1
-            name = f"{base_name}__{k}"
+            name = f"{base}__{n}"
+            n += 1
         used.add(name)
         columns.append(name)
 
     return columns
 
 
+@st.cache_data(show_spinner=False)
 def read_excel_gus(path):
     xls = pd.ExcelFile(path, engine="openpyxl")
     candidates = []
 
     for sheet in xls.sheet_names:
-        raw = pd.read_excel(
-            path,
-            sheet_name=sheet,
-            header=None,
-            engine="openpyxl",
-        )
+        raw = pd.read_excel(path, sheet_name=sheet, header=None, engine="openpyxl")
         if raw.empty:
             continue
 
-        code_name_row = find_code_name_row(raw)
-        if code_name_row is None:
+        code_row = find_code_row(raw)
+        if code_row is None:
             continue
-
-        data_start = find_data_start(raw, code_name_row)
-        columns = build_flat_gus_columns(raw, code_name_row, data_start)
+        data_start = find_data_start(raw, code_row)
+        columns = build_xlsx_headers(raw, code_row, data_start)
 
         data = raw.iloc[data_start:].copy()
-        data.columns = columns[:data.shape[1]]
+        data.columns = columns
         data = data.dropna(how="all")
         if data.empty:
             continue
 
-        # Usuwamy całkowicie puste kolumny.
+        # Tylko niepuste kolumny.
         data = data.loc[:, ~data.isna().all(axis=0)].copy()
         data.columns = [normalize_text(c) for c in data.columns]
 
@@ -344,15 +349,14 @@ def read_excel_gus(path):
             score += 10000
         if "Nazwa" in data.columns:
             score += 1000
-        score += 10 * sum(year_from_text(c) is not None for c in data.columns)
-        score += min(data.shape[1], 100)
-
+        score += 20 * len(get_years_from_columns(data.columns))
+        score += min(data.shape[1], 200)
         candidates.append((score, sheet, data))
 
     if not candidates:
         raise ValueError(
-            f"Nie udało się odczytać tabeli GUS z pliku '{Path(path).name}'. "
-            "Nie znaleziono nagłówka z Kod/Nazwa."
+            f"Nie znaleziono właściwej tabeli GUS w pliku {Path(path).name}. "
+            "Nie znaleziono nagłówka Kod/Nazwa."
         )
 
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -360,14 +364,13 @@ def read_excel_gus(path):
 
 
 # ============================================================
-# 5. ROBUSTNY ODCZYT GUS CSV
+# 5. ODCZYT GUS CSV
 # ============================================================
 
 
+@st.cache_data(show_spinner=False)
 def read_csv_gus(path):
     best = None
-    errors = []
-
     encodings = ["utf-8-sig", "utf-8", "cp1250", "windows-1250", "latin1"]
     separators = [";", ",", "\t"]
 
@@ -382,124 +385,113 @@ def read_csv_gus(path):
                     quotechar='"',
                 )
                 df.columns = [normalize_text(c) for c in df.columns]
-
-                score = 0
                 lows = [normalize_low(c) for c in df.columns]
+                score = 0
                 if "kod" in lows:
                     score += 10000
                 if "nazwa" in lows:
                     score += 1000
-                score += 10 * sum(year_from_text(c) is not None for c in df.columns)
-                score += min(df.shape[1], 100)
-
+                score += 20 * len(get_years_from_columns(df.columns))
+                score += min(df.shape[1], 200)
                 if best is None or score > best[0]:
                     best = (score, df)
-            except Exception as exc:
-                errors.append(str(exc))
+            except Exception:
+                continue
 
     if best is None:
-        raise ValueError(
-            f"Nie udało się odczytać CSV '{Path(path).name}'. "
-            f"Ostatni błąd: {errors[-1] if errors else 'nieznany błąd'}"
-        )
+        raise ValueError(f"Nie udało się odczytać CSV {Path(path).name}.")
     return best[1]
 
 
 def read_table(path):
     suffix = Path(path).suffix.lower()
     if suffix in {".xlsx", ".xlsm", ".xls"}:
-        return read_excel_gus(path)
+        return read_excel_gus(str(path))
     if suffix == ".csv":
-        return read_csv_gus(path)
+        return read_csv_gus(str(path))
     raise ValueError(f"Nieobsługiwany format pliku: {suffix}")
 
 
 # ============================================================
-# 6. WYBÓR KOLUMN ROCZNYCH
+# 6. SELEKCJA KOLUMN – HEURYSTYKA ODPORNA NA ZMIANY GUS
 # ============================================================
 
 
-def column_matches(col, required=None, any_of=None, exclude=None):
-    text = normalize_low(col)
-    required = required or []
-    any_of = any_of or []
-    exclude = exclude or []
-
-    if any(req.lower() not in text for req in required):
-        return False
-    if any_of and not any(item.lower() in text for item in any_of):
-        return False
-    if any(item.lower() in text for item in exclude):
-        return False
-    return True
-
-
-def find_matching_year_column(
+def choose_year_column(
     df,
     year,
-    required=None,
-    any_of=None,
-    exclude=None,
-    allow_fallback=False,
+    include_all=(),
+    include_any=(),
+    exclude=(),
+    prefer=(),
 ):
-    candidates = [
-        c for c in df.columns
-        if col_has_year(c, year)
-        and column_matches(c, required=required, any_of=any_of, exclude=exclude)
-    ]
+    candidates = []
+    for col in df.columns:
+        text = normalize_low(col)
+        if not col_has_year(col, year):
+            continue
+        if any(term.lower() not in text for term in include_all):
+            continue
+        if include_any and not any(term.lower() in text for term in include_any):
+            continue
+        if any(term.lower() in text for term in exclude):
+            continue
 
-    if not candidates and allow_fallback:
-        candidates = [c for c in df.columns if col_has_year(c, year)]
+        score = 0
+        for term in prefer:
+            if term.lower() in text:
+                score += 50
+        if "wartość liczbowa" in text:
+            score += 100
+        if "wskaźnik precyzji" in text or "precyzji" in text:
+            score -= 1000
+        if "polska=100" in text or "polska = 100" in text:
+            score -= 900
+        if "%" in text and "wartość liczbowa" not in text:
+            score -= 300
+        candidates.append((score, col))
 
     if not candidates:
         return None
-
-    def score(col):
-        text = normalize_low(col)
-        s = 0
-        if "wartość liczbowa" in text:
-            s += 100
-        if "ogółem" in text:
-            s += 40
-        if "wartość" in text:
-            s += 20
-        if "wskaźnik precyzji" in text or "precyzji" in text:
-            s -= 1000
-        if "polska = 100" in text or "polska=100" in text:
-            s -= 800
-        return s
-
-    return sorted(candidates, key=score, reverse=True)[0]
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
-def wide_to_long(df, value_name, selector, years):
+def panel_from_selector(df, value_name, selector, years):
     if "Kod" not in df.columns:
         raise ValueError(
-            f"Nie znaleziono wymaganej kolumny 'Kod'. Dostępne kolumny: {list(df.columns)}"
+            f"Tabela nie zawiera kolumny Kod. Dostępne: {list(df.columns)[:25]}"
         )
 
     rows = []
+    used = []
     for year in years:
         col = selector(df, int(year))
         if col is None:
             continue
-        part = df[["Kod", col]].copy()
-        part.columns = ["Kod", value_name]
+        keep_cols = ["Kod"]
+        if "Nazwa" in df.columns:
+            keep_cols.append("Nazwa")
+        keep_cols.append(col)
+        part = df[keep_cols].copy()
+        rename_map = {"Kod": "Kod", col: value_name}
+        if "Nazwa" in part.columns:
+            rename_map["Nazwa"] = "Nazwa"
+        part = part.rename(columns=rename_map)
         part["Rok"] = int(year)
         part[value_name] = numeric_series(part[value_name])
         rows.append(part)
+        used.append((int(year), col))
 
     if not rows:
         raise ValueError(
-            f"Nie znaleziono danych dla zmiennej '{value_name}'. "
-            f"Dostępne kolumny: {list(df.columns)}"
+            f"Nie znaleziono kolumn dla '{value_name}'. "
+            f"Dostępne lata w tabeli: {get_years_from_columns(df.columns)}"
         )
 
     out = pd.concat(rows, ignore_index=True)
-    out["Kod"] = out["Kod"].map(extract_teryt)
-    out = out.dropna(subset=["Kod"])
-    out = out.drop_duplicates(["Kod", "Rok"])
-    return out
+    out = clean_key_panel(out)
+    return out, used
 
 
 # ============================================================
@@ -509,101 +501,131 @@ def wide_to_long(df, value_name, selector, years):
 
 def build_ryne_panel(unemployment_df, employment_df):
     def unemployment_selector(df, year):
-        return find_matching_year_column(
+        return choose_year_column(
             df,
             year,
-            required=["ogółem", "wartość liczbowa"],
-            exclude=["wskaźnik precyzji", "precyzji", "polska = 100", "polska=100"],
-            allow_fallback=False,
+            include_all=("ogółem",),
+            include_any=("wartość liczbowa",),
+            exclude=("precyzji", "polska=100", "polska = 100", "15-24", "15-29", "15-64"),
+            prefer=("wartość liczbowa", "ogółem"),
         )
 
     def employment_selector(df, year):
-        return find_matching_year_column(
+        return choose_year_column(
             df,
             year,
-            required=["ogółem", "wartość liczbowa"],
-            exclude=["wskaźnik precyzji", "precyzji", "polska = 100", "polska=100"],
-            allow_fallback=False,
+            include_all=("ogółem",),
+            include_any=("wartość liczbowa",),
+            exclude=("precyzji", "polska=100", "polska = 100", "15-24", "15-29", "15-64"),
+            prefer=("wartość liczbowa", "ogółem"),
         )
 
-    unemployment = wide_to_long(
+    years_u = range(2000, 2026)
+    years_e = range(2000, 2026)
+    unemployment, _ = panel_from_selector(
         unemployment_df,
         "Stopa_Bezrobocia_BAEL",
         unemployment_selector,
-        range(2010, 2026),
+        years_u,
     )
-
-    employment = wide_to_long(
+    employment, _ = panel_from_selector(
         employment_df,
         "Stopa_Zatrudnienia",
         employment_selector,
-        range(2010, 2026),
+        years_e,
     )
 
-    return employment.merge(
-        unemployment,
-        on=["Kod", "Rok"],
+    merged = employment.merge(
+        unemployment[["Wojewodztwo", "Rok", "Stopa_Bezrobocia_BAEL"]],
+        on=["Wojewodztwo", "Rok"],
         how="inner",
     )
+    merged["Kod"] = merged["Wojewodztwo"].map({v: k for k, v in WOJEWODZTWA_MAP.items()})
+    return merged, {
+        "employment_years": sorted(employment["Rok"].unique()),
+        "unemployment_years": sorted(unemployment["Rok"].unique()),
+    }
 
 
 # ============================================================
-# 8. WYNAGRODZENIA – REGIONALNY KAITZ
+# 8. REGIONALNE WYNAGRODZENIE – KAITZ
 # ============================================================
 
 
 def build_regional_wages(wyna_df):
-    def wage_selector(df, year):
-        candidates = [
-            c for c in df.columns
-            if col_has_year(c, year)
-            and re.search(r"\brok\b", normalize_low(c))
-            and "wartość liczbowa" in normalize_low(c)
-            and "wskaźnik precyzji" not in normalize_low(c)
-        ]
-        if not candidates:
-            candidates = [
-                c for c in df.columns
-                if col_has_year(c, year)
-                and re.search(r"\brok\b", normalize_low(c))
-                and "wskaźnik precyzji" not in normalize_low(c)
-            ]
-        return candidates[0] if candidates else None
+    def selector(df, year):
+        candidates = []
+        for col in df.columns:
+            text = normalize_low(col)
+            if not col_has_year(col, year):
+                continue
+            if "rok" not in text and "wynagrodzenia" not in text and "wynagrodzenie" not in text:
+                continue
+            if "wskaźnik precyzji" in text or "precyzji" in text:
+                continue
+            if "%" in text and "wartość liczbowa" not in text:
+                continue
 
-    return wide_to_long(
+            score = 0
+            if "wynagrodzenia ogółem" in text or "wynagrodzenie ogółem" in text:
+                score += 300
+            if "bez wypłat nagród rocznych" in text:
+                score += 50
+            if "wartość liczbowa" in text:
+                score += 100
+            candidates.append((score, col))
+
+        if not candidates:
+            return choose_year_column(
+                df,
+                year,
+                include_all=("rok",),
+                exclude=("precyzji", "%"),
+                prefer=("wynagrodzenia ogółem", "wynagrodzenie ogółem", "wartość liczbowa"),
+            )
+        return sorted(candidates, reverse=True)[0][1]
+
+    wages, used = panel_from_selector(
         wyna_df,
         "Przecietne_Wynagrodzenie_Regionalne",
-        wage_selector,
-        range(2010, 2026),
+        selector,
+        range(2000, 2026),
     )
+    wages = wages[wages["Przecietne_Wynagrodzenie_Regionalne"] > 0].copy()
+    return wages, {"columns": used}
 
 
 # ============================================================
-# 9. RACH – PKB NOMINALNY + DYNAMIKA REALNEGO PKB
+# 9. RACH 3502 – DYNAMIKA REALNEGO PKB
 # ============================================================
 
 
-def build_gdp_panel(gdp_growth_df):
-    def growth_selector(df, year):
-        # RACH 3502 zawiera dynamikę produktu krajowego brutto
-        # w cenach stałych, rok poprzedni=100.
-        return find_matching_year_column(
+def build_gdp_growth(gdp_df):
+    def selector(df, year):
+        return choose_year_column(
             df,
             year,
-            required=["dynamika produktu krajowego brutto ogółem"],
-            any_of=["rok poprzedni=100", "rok poprzedni = 100"],
-            exclude=["precyzji"],
-            allow_fallback=False,
+            include_all=("dynamika",),
+            include_any=(
+                "produkt krajowy brutto",
+                "produktu krajowego brutto",
+            ),
+            exclude=("precyzji", "polska=100", "polska = 100", "w odsetkach"),
+            prefer=(
+                "rok poprzedni=100",
+                "rok poprzedni = 100",
+                "wartość liczbowa",
+            ),
         )
 
-    growth_index = wide_to_long(
-        gdp_growth_df,
+    index_df, used = panel_from_selector(
+        gdp_df,
         "Dynamika_PKB_100",
-        growth_selector,
-        range(2010, 2025),
+        selector,
+        range(2000, 2026),
     )
-    growth_index["Wzrost_PKB"] = growth_index["Dynamika_PKB_100"] - 100.0
-    return growth_index[["Kod", "Rok", "Wzrost_PKB"]]
+    index_df["Wzrost_PKB"] = index_df["Dynamika_PKB_100"] - 100.0
+    return index_df[["Kod", "Wojewodztwo", "Rok", "Wzrost_PKB"]], {"columns": used}
 
 
 # ============================================================
@@ -611,223 +633,231 @@ def build_gdp_panel(gdp_growth_df):
 # ============================================================
 
 
-def _section_exact(col, section):
-    text = normalize_low(col)
-    section_low = section.lower()
-    # Odróżnia „Sekcja B” od „Sekcja B+C+D+E”.
-    if section_low == "sekcja b":
-        return bool(re.search(r"sekcja b(?!\+)", text))
-    if section_low == "sekcja c":
-        return bool(re.search(r"sekcja c(?!\+)", text))
-    if section_low == "sekcja d":
-        return bool(re.search(r"sekcja d(?!\+)", text))
-    if section_low == "sekcja e":
-        return bool(re.search(r"sekcja e(?!\+)", text))
-    return section_low in text
+def _best_gva_column(df, year, mode):
+    candidates = []
+    for col in df.columns:
+        text = normalize_low(col)
+        if not col_has_year(col, year):
+            continue
+        if "wskaźnik precyzji" in text or "precyzji" in text:
+            continue
+        if "polska=100" in text or "polska = 100" in text:
+            continue
+        if "dynamika" in text:
+            continue
+        if "w odsetkach" in text:
+            continue
+        if "%" in text and "wartość liczbowa" not in text:
+            continue
+
+        score = 0
+        if "wartość liczbowa" in text:
+            score += 150
+
+        if mode == "total":
+            if "wartość dodana brutto" in text:
+                score += 180
+            if "ogółem" in text:
+                score += 120
+            if "przemysł" in text:
+                score -= 50
+            if "rolnictwo" in text or "budownictwo" in text or "usługi" in text:
+                score -= 50
+        else:
+            if "przemysł" in text:
+                score += 300
+            if "b+c+d+e" in text:
+                score += 250
+            if "sekcja c" in text and "+" not in text:
+                score += 170
+            if "budownictwo" in text:
+                score -= 80
+            if "rolnictwo" in text:
+                score -= 80
+            if "usługi" in text:
+                score -= 60
+
+        candidates.append((score, col))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
 def build_gva_panel(gva_df):
     if "Kod" not in gva_df.columns:
-        raise ValueError(
-            f"RACH 3505 nie zawiera kolumny 'Kod'. Dostępne: {list(gva_df.columns)}"
-        )
-
-    def select_total(df, year):
-        candidates = [
-            c for c in df.columns
-            if col_has_year(c, year)
-            and "ogółem" in normalize_low(c)
-            and "wartość liczbowa" in normalize_low(c)
-            and "wskaźnik precyzji" not in normalize_low(c)
-            and "%" not in normalize_text(c)
-        ]
-        if not candidates:
-            candidates = [
-                c for c in df.columns
-                if col_has_year(c, year)
-                and "ogółem" in normalize_low(c)
-                and "wskaźnik precyzji" not in normalize_low(c)
-            ]
-        return candidates[0] if candidates else None
-
-    def select_section(df, year, section):
-        candidates = [
-            c for c in df.columns
-            if col_has_year(c, year)
-            and _section_exact(c, section)
-            and "wartość liczbowa" in normalize_low(c)
-            and "wskaźnik precyzji" not in normalize_low(c)
-            and "%" not in normalize_text(c)
-        ]
-        if not candidates:
-            candidates = [
-                c for c in df.columns
-                if col_has_year(c, year)
-                and _section_exact(c, section)
-                and "wskaźnik precyzji" not in normalize_low(c)
-                and "%" not in normalize_text(c)
-                and "polska=100" not in normalize_low(c)
-                and "polska = 100" not in normalize_low(c)
-            ]
-        return candidates[0] if candidates else None
+        raise ValueError("RACH 3505 nie zawiera kolumny Kod.")
 
     rows = []
-    for year in range(2010, 2025):
-        total_col = select_total(gva_df, year)
-        if total_col is None:
+    used = []
+    for year in range(2000, 2026):
+        total_col = _best_gva_column(gva_df, year, "total")
+        industry_col = _best_gva_column(gva_df, year, "industry")
+        if total_col is None or industry_col is None:
             continue
 
-        section_cols = {
-            sec: select_section(gva_df, year, sec)
-            for sec in ["Sekcja B", "Sekcja C", "Sekcja D", "Sekcja E"]
-        }
-
-        if all(section_cols.values()):
-            part = gva_df[[
-                "Kod",
-                total_col,
-                section_cols["Sekcja B"],
-                section_cols["Sekcja C"],
-                section_cols["Sekcja D"],
-                section_cols["Sekcja E"],
-            ]].copy()
-            part.columns = [
-                "Kod", "WDB_Ogolem", "WDB_B", "WDB_C", "WDB_D", "WDB_E"
-            ]
-            for c in ["WDB_Ogolem", "WDB_B", "WDB_C", "WDB_D", "WDB_E"]:
-                part[c] = numeric_series(part[c])
-            part["WDB_Przemysl"] = part[["WDB_B", "WDB_C", "WDB_D", "WDB_E"]].sum(axis=1, min_count=4)
-        else:
-            # Awaryjnie: tabela może zawierać gotową agregację B+C+D+E.
-            industry = [
-                c for c in gva_df.columns
-                if col_has_year(c, year)
-                and "b+c+d+e" in normalize_low(c)
-                and "wartość liczbowa" in normalize_low(c)
-                and "wskaźnik precyzji" not in normalize_low(c)
-            ]
-            if not industry:
-                continue
-            part = gva_df[["Kod", total_col, industry[0]]].copy()
-            part.columns = ["Kod", "WDB_Ogolem", "WDB_Przemysl"]
-            part["WDB_Ogolem"] = numeric_series(part["WDB_Ogolem"])
-            part["WDB_Przemysl"] = numeric_series(part["WDB_Przemysl"])
-
-        part["Rok"] = year
-        rows.append(part[["Kod", "WDB_Ogolem", "WDB_Przemysl", "Rok"]])
+        keep_cols = ["Kod"]
+        if "Nazwa" in gva_df.columns:
+            keep_cols.append("Nazwa")
+        keep_cols += [total_col, industry_col]
+        part = gva_df[keep_cols].copy()
+        rename_map = {total_col: "WDB_Ogolem", industry_col: "WDB_Przemysl"}
+        if "Nazwa" in part.columns:
+            rename_map["Nazwa"] = "Nazwa"
+        part = part.rename(columns=rename_map)
+        part["Rok"] = int(year)
+        part["WDB_Ogolem"] = numeric_series(part["WDB_Ogolem"])
+        part["WDB_Przemysl"] = numeric_series(part["WDB_Przemysl"])
+        part["Udzial_Przemyslu_GVA"] = np.where(
+            part["WDB_Ogolem"] > 0,
+            part["WDB_Przemysl"] / part["WDB_Ogolem"],
+            np.nan,
+        )
+        rows.append(part[["Kod", "Rok", "WDB_Ogolem", "WDB_Przemysl", "Udzial_Przemyslu_GVA"]])
+        used.append((year, total_col, industry_col))
 
     if not rows:
         raise ValueError(
-            "Nie udało się zbudować panelu RACH 3505. "
-            f"Dostępne kolumny: {list(gva_df.columns)}"
+            "Nie udało się wyodrębnić WDB ogółem i przemysłu z RACH 3505. "
+            f"Dostępne kolumny: {list(gva_df.columns)[:60]}"
         )
 
     out = pd.concat(rows, ignore_index=True)
-    out["Kod"] = out["Kod"].map(extract_teryt)
-    out["Udzial_Przemyslu_GVA"] = np.where(
-        out["WDB_Ogolem"] > 0,
-        out["WDB_Przemysl"] / out["WDB_Ogolem"],
-        np.nan,
-    )
-    return out
+    out = clean_key_panel(out)
+    return out, {"columns": used}
 
 
 # ============================================================
-# 11. RACH 3510 – PRODUKTYWNOŚĆ
+# 11. RACH 3510 – PRODUKTYWNOŚĆ (ZMIENNA OPCJONALNA)
 # ============================================================
 
 
 def build_productivity_panel(productivity_df):
-    def productivity_selector(df, year):
-        candidates = [
-            c for c in df.columns
-            if col_has_year(c, year)
-            and "wartość dodana brutto na 1 pracującego" in normalize_low(c)
-            and "dynamika" not in normalize_low(c)
-            and "polska=100" not in normalize_low(c)
-            and "polska = 100" not in normalize_low(c)
-            and "wskaźnik precyzji" not in normalize_low(c)
-        ]
-        if not candidates:
-            candidates = [
-                c for c in df.columns
-                if col_has_year(c, year)
-                and "na 1 pracującego" in normalize_low(c)
-                and "dynamika" not in normalize_low(c)
-                and "wskaźnik precyzji" not in normalize_low(c)
-            ]
-        return candidates[0] if candidates else None
+    def selector(df, year):
+        return choose_year_column(
+            df,
+            year,
+            include_all=("na 1 pracującego",),
+            exclude=("precyzji", "dynamika", "polska=100", "polska = 100", "w odsetkach"),
+            prefer=("wartość dodana brutto", "wartość liczbowa", "ogółem"),
+        )
 
-    return wide_to_long(
+    productivity, used = panel_from_selector(
         productivity_df,
         "Produktywnosc",
-        productivity_selector,
-        range(2010, 2025),
+        selector,
+        range(2000, 2026),
     )
+    productivity = productivity[productivity["Produktywnosc"] > 0].copy()
+    return productivity, {"columns": used}
 
 
 # ============================================================
-# 12. BUDOWA FINALNEGO PANELU
+# 12. FINALNY PANEL – AUTOMATYCZNE WYKRYCIE WSPÓLNEGO OKNA
 # ============================================================
+
+
+def merge_source(base, other, name):
+    before = len(base)
+    value_cols = [c for c in other.columns if c not in {"Kod", "Nazwa", "Wojewodztwo", "Rok"}]
+    other_small = other[["Wojewodztwo", "Rok"] + value_cols].copy()
+    out = base.merge(other_small, on=["Wojewodztwo", "Rok"], how="inner")
+    out["Kod"] = out["Wojewodztwo"].map({v: k for k, v in WOJEWODZTWA_MAP.items()})
+    return out, {"source": name, "before": before, "after": len(out)}
+
 
 @st.cache_data(show_spinner=False)
 def load_and_clean_data(
-    ryne_unemployment_path,
-    ryne_employment_path,
-    wyna_regional_path,
-    rach_growth_path,
-    rach_gva_path,
-    rach_productivity_path,
+    unemployment_path,
+    employment_path,
+    wages_path,
+    gdp_path,
+    gva_path,
+    productivity_path=None,
 ):
-    sources = {
-        "RYNE 4100": ryne_unemployment_path,
-        "RYNE 4112": ryne_employment_path,
-        "WYNA 2504": wyna_regional_path,
-        "RACH 3502": rach_growth_path,
-        "RACH 3505": rach_gva_path,
-        "RACH 3510": rach_productivity_path,
-    }
+    raw_unemployment = read_table(unemployment_path)
+    raw_employment = read_table(employment_path)
+    raw_wages = read_table(wages_path)
+    raw_gdp = read_table(gdp_path)
+    raw_gva = read_table(gva_path)
 
-    loaded = {}
-    for label, path in sources.items():
+    sources = {}
+
+    ryne, ryne_info = build_ryne_panel(raw_unemployment, raw_employment)
+    wages, wages_info = build_regional_wages(raw_wages)
+    gdp, gdp_info = build_gdp_growth(raw_gdp)
+    gva, gva_info = build_gva_panel(raw_gva)
+
+    sources["RYNE"] = ryne_info
+    sources["WYNA"] = wages_info
+    sources["RACH_3502"] = gdp_info
+    sources["RACH_3505"] = gva_info
+
+    # Produktywność jest dodatkiem. Nie może wyzerować całego panelu tylko
+    # dlatego, że GUS nie podał jej dla części lat.
+    productivity = None
+    if productivity_path is not None and Path(productivity_path).exists():
         try:
-            loaded[label] = read_table(path)
+            raw_productivity = read_table(productivity_path)
+            productivity, productivity_info = build_productivity_panel(raw_productivity)
+            sources["RACH_3510"] = productivity_info
         except Exception as exc:
-            raise ValueError(f"Błąd odczytu {label} ({Path(path).name}): {exc}") from exc
+            sources["RACH_3510"] = {"error": str(exc)}
 
-    ryne = build_ryne_panel(loaded["RYNE 4100"], loaded["RYNE 4112"])
-    wages = build_regional_wages(loaded["WYNA 2504"])
-    gdp = build_gdp_panel(loaded["RACH 3502"])
-    gva = build_gva_panel(loaded["RACH 3505"])
-    productivity = build_productivity_panel(loaded["RACH 3510"])
+    # Wspólne lata tylko dla zmiennych rdzeniowych.
+    year_sets = [
+        set(ryne["Rok"].unique()),
+        set(wages["Rok"].unique()),
+        set(gdp["Rok"].unique()),
+        set(gva["Rok"].unique()),
+    ]
+    common_years = sorted(set.intersection(*year_sets))
 
-    df = ryne.merge(wages, on=["Kod", "Rok"], how="inner")
-    df = df.merge(gdp, on=["Kod", "Rok"], how="inner")
-    df = df.merge(gva, on=["Kod", "Rok"], how="inner")
-    df = df.merge(productivity, on=["Kod", "Rok"], how="inner")
+    # Równocześnie ograniczamy treatment do lat, dla których znamy płacę minimalną.
+    common_years = sorted(set(common_years) & set(MIN_WAGE_PL.keys()))
+
+    if len(common_years) < 3:
+        raise ValueError(
+            "Nie znaleziono co najmniej 3 wspólnych lat dla podstawowych źródeł.\n\n"
+            f"RYNE: {sorted(ryne['Rok'].unique())}\n"
+            f"WYNA: {sorted(wages['Rok'].unique())}\n"
+            f"RACH 3502: {sorted(gdp['Rok'].unique())}\n"
+            f"RACH 3505: {sorted(gva['Rok'].unique())}"
+        )
+
+    ryne = ryne[ryne["Rok"].isin(common_years)].copy()
+    wages = wages[wages["Rok"].isin(common_years)].copy()
+    gdp = gdp[gdp["Rok"].isin(common_years)].copy()
+    gva = gva[gva["Rok"].isin(common_years)].copy()
+
+    df = ryne
+    merge_log = []
+    for name, other in [
+        ("WYNA 2504", wages),
+        ("RACH 3502", gdp),
+        ("RACH 3505", gva),
+    ]:
+        df, info = merge_source(df, other, name)
+        merge_log.append(info)
+
+    if productivity is not None:
+        productivity = productivity[productivity["Rok"].isin(common_years)].copy()
+        prod_cols = ["Wojewodztwo", "Rok"] + [c for c in productivity.columns if c not in {"Kod", "Nazwa", "Wojewodztwo", "Rok"}]
+        df = df.merge(productivity[prod_cols], on=["Wojewodztwo", "Rok"], how="left")
 
     df["Wojewodztwo"] = df["Kod"].map(WOJEWODZTWA_MAP)
     df["Placa_Minimalna"] = df["Rok"].map(MIN_WAGE_PL)
-
-    # Regionalny Kaitz – treatment ma zmienność między regionami i w czasie.
     df["Kaitz_Index"] = (
-        df["Placa_Minimalna"] /
-        df["Przecietne_Wynagrodzenie_Regionalne"]
+        df["Placa_Minimalna"] / df["Przecietne_Wynagrodzenie_Regionalne"]
     )
-    df["Kaitz_Procent"] = 100 * df["Kaitz_Index"]
+    df["Kaitz_Procent"] = 100.0 * df["Kaitz_Index"]
 
     numeric_cols = [
-        "Rok",
-        "Stopa_Zatrudnienia",
-        "Stopa_Bezrobocia_BAEL",
-        "Przecietne_Wynagrodzenie_Regionalne",
-        "Placa_Minimalna",
-        "Kaitz_Index",
-        "Kaitz_Procent",
-        "Wzrost_PKB",
-        "WDB_Ogolem",
-        "WDB_Przemysl",
-        "Udzial_Przemyslu_GVA",
+        "Rok", "Stopa_Zatrudnienia", "Stopa_Bezrobocia_BAEL",
+        "Przecietne_Wynagrodzenie_Regionalne", "Placa_Minimalna",
+        "Kaitz_Index", "Kaitz_Procent", "Wzrost_PKB",
+        "WDB_Ogolem", "WDB_Przemysl", "Udzial_Przemyslu_GVA",
         "Produktywnosc",
     ]
     for col in numeric_cols:
@@ -836,82 +866,114 @@ def load_and_clean_data(
 
     df = df.replace([np.inf, -np.inf], np.nan)
 
-    # W regionalnej stopie bezrobocia BAEL wartości 0,0% są w tym
-    # eksporcie oznaczeniem braków danych dla części obserwacji, a nie
-    # realistyczną stopą bezrobocia. Traktujemy je więc jako brak.
+    # W eksporcie RYNE 4100 dla części obserwacji 0,0% jest brakiem danych.
     df.loc[df["Stopa_Bezrobocia_BAEL"] <= 0, "Stopa_Bezrobocia_BAEL"] = np.nan
+    df.loc[df["Przecietne_Wynagrodzenie_Regionalne"] <= 0, "Przecietne_Wynagrodzenie_Regionalne"] = np.nan
+    df.loc[df["Kaitz_Index"] <= 0, "Kaitz_Index"] = np.nan
 
-    # Podstawowa kontrola zakresów przed estymacją.
-    df.loc[~df["Przecietne_Wynagrodzenie_Regionalne"].gt(0), "Przecietne_Wynagrodzenie_Regionalne"] = np.nan
-    df.loc[~df["Kaitz_Index"].gt(0), "Kaitz_Index"] = np.nan
-
-    required = [
-        "Wojewodztwo",
-        "Kod",
-        "Rok",
-        "Kaitz_Index",
-        "Stopa_Zatrudnienia",
-        "Stopa_Bezrobocia_BAEL",
-        "Wzrost_PKB",
-        "Udzial_Przemyslu_GVA",
-        "Produktywnosc",
+    core_required = [
+        "Wojewodztwo", "Kod", "Rok", "Kaitz_Index",
+        "Stopa_Zatrudnienia", "Stopa_Bezrobocia_BAEL",
+        "Wzrost_PKB", "Udzial_Przemyslu_GVA",
     ]
-    df = df.dropna(subset=required).copy()
+    df = df.dropna(subset=core_required).copy()
     df = df.sort_values(["Wojewodztwo", "Rok"]).reset_index(drop=True)
 
     if df.empty:
         raise ValueError(
-            "Po połączeniu tabel nie pozostały kompletne obserwacje panelowe. "
-            "Zakresy lat lub selekcja kolumn GUS nie pokrywają się."
+            "Po połączeniu źródeł nie pozostała żadna obserwacja.\n\n"
+            f"Wspólne lata rdzenia: {common_years}\n"
+            f"RYNE: {len(ryne)} wierszy, kody: {sorted(ryne['Kod'].dropna().unique())}\n"
+            f"WYNA: {len(wages)} wierszy, kody: {sorted(wages['Kod'].dropna().unique())}\n"
+            f"RACH 3502: {len(gdp)} wierszy, kody: {sorted(gdp['Kod'].dropna().unique())}\n"
+            f"RACH 3505: {len(gva)} wierszy, kody: {sorted(gva['Kod'].dropna().unique())}\n"
+            f"Stan po merge: {merge_log}\n"
         )
 
     n_regions = df["Wojewodztwo"].nunique()
     n_years = df["Rok"].nunique()
     if n_regions < 4:
         raise ValueError(
-            f"Po czyszczeniu znaleziono tylko {n_regions} województwa. "
-            "Sprawdź Kod/TERYT."
+            f"Po połączeniu pozostały tylko {n_regions} województwa. "
+            "To za mało do sensownej analizy panelowej."
         )
     if n_years < 3:
         raise ValueError(
-            f"Po czyszczeniu znaleziono tylko {n_years} lata."
+            f"Po połączeniu pozostało tylko {n_years} lata: {sorted(df['Rok'].unique())}."
         )
 
-    return df
+    diagnostics = {
+        "common_years": common_years,
+        "source_years": {
+            "RYNE 4112/4100": sorted(ryne["Rok"].unique()),
+            "WYNA 2504": sorted(wages["Rok"].unique()),
+            "RACH 3502": sorted(gdp["Rok"].unique()),
+            "RACH 3505": sorted(gva["Rok"].unique()),
+            "RACH 3510": sorted(productivity["Rok"].unique()) if productivity is not None else [],
+        },
+        "merge_log": merge_log,
+        "n_regions": n_regions,
+        "n_years": n_years,
+    }
+
+    return df, diagnostics, sources
 
 
 # ============================================================
-# 13. BENCHMARK – POOLED OLS + TWO-WAY FE
+# 13. MODELE
 # ============================================================
+
+
+def build_formula(include_productivity=False, fixed_effects=False):
+    terms = [
+        "Kaitz_Index",
+        "Stopa_Bezrobocia_BAEL",
+        "Wzrost_PKB",
+        "Udzial_Przemyslu_GVA",
+    ]
+    if include_productivity:
+        terms.append("Produktywnosc")
+    formula = "Stopa_Zatrudnienia ~ " + " + ".join(terms)
+    if fixed_effects:
+        formula += " + C(Wojewodztwo) + C(Rok)"
+    return formula
+
+
+def select_model_frame(df):
+    work = df.copy()
+    # Produktywność dodajemy tylko wtedy, gdy nie powoduje dużego spadku próby.
+    include_productivity = "Produktywnosc" in work.columns
+    if include_productivity:
+        completeness = work["Produktywnosc"].notna().mean()
+        include_productivity = completeness >= 0.85
+    return work, include_productivity
 
 
 def run_benchmark(df):
-    base = (
-        "Stopa_Zatrudnienia ~ Kaitz_Index + "
-        "Stopa_Bezrobocia_BAEL + Wzrost_PKB + "
-        "Udzial_Przemyslu_GVA + Produktywnosc"
-    )
+    work, include_productivity = select_model_frame(df)
+    formula_base = build_formula(include_productivity, fixed_effects=False)
+    formula_fe = build_formula(include_productivity, fixed_effects=True)
 
-    pooled = smf.ols(base, data=df).fit(cov_type="HC1")
-    twfe = smf.ols(
-        base + " + C(Wojewodztwo) + C(Rok)",
-        data=df,
-    ).fit(
+    required = [
+        "Stopa_Zatrudnienia", "Kaitz_Index", "Stopa_Bezrobocia_BAEL",
+        "Wzrost_PKB", "Udzial_Przemyslu_GVA",
+    ]
+    if include_productivity:
+        required.append("Produktywnosc")
+    work = work.dropna(subset=required).copy()
+
+    pooled = smf.ols(formula_base, data=work).fit(cov_type="HC1")
+    twfe = smf.ols(formula_fe, data=work).fit(
         cov_type="cluster",
-        cov_kwds={"groups": df["Wojewodztwo"]},
+        cov_kwds={"groups": work["Wojewodztwo"]},
     )
-    return pooled, twfe
+    return pooled, twfe, include_productivity, work
 
 
-# ============================================================
-# 14. DML + CAUSAL FOREST
-# ============================================================
-
-CF_X_COLS = [
+CF_BASE_X = [
     "Stopa_Bezrobocia_BAEL",
     "Wzrost_PKB",
     "Udzial_Przemyslu_GVA",
-    "Produktywnosc",
 ]
 
 
@@ -948,19 +1010,24 @@ def run_causal_forest(df):
             f"Szczegóły: {ECONML_IMPORT_ERROR}"
         )
 
-    x_cols = [c for c in CF_X_COLS if c in df.columns]
-    frame = df[["Stopa_Zatrudnienia", "Kaitz_Index"] + x_cols].copy()
-    valid = frame.notna().all(axis=1)
-    work = df.loc[valid].copy()
+    x_cols = list(CF_BASE_X)
+    if "Produktywnosc" in df.columns and df["Produktywnosc"].notna().mean() >= 0.85:
+        x_cols.append("Produktywnosc")
+
+    required = ["Stopa_Zatrudnienia", "Kaitz_Index"] + x_cols
+    work = df.dropna(subset=required).copy()
 
     if len(work) < 40:
         raise ValueError(
-            f"Po czyszczeniu pozostało tylko {len(work)} obserwacji. "
-            "To za mało dla stabilnej estymacji Causal Forest."
+            f"Do Causal Forest pozostało {len(work)} obserwacji. Potrzeba co najmniej 40."
+        )
+    if work["Kaitz_Index"].nunique() < 20:
+        raise ValueError(
+            "Treatment Kaitz Index ma zbyt małą zmienność dla Causal Forest."
         )
 
-    Y = work["Stopa_Zatrudnienia"].to_numpy(dtype=float)
-    T = work["Kaitz_Index"].to_numpy(dtype=float)
+    Y = work["Stopa_Zatrudnienia"].to_numpy(float)
+    T = work["Kaitz_Index"].to_numpy(float)
     X = work[x_cols].astype(float)
     W = build_nuisance_controls(work)
 
@@ -968,7 +1035,7 @@ def run_causal_forest(df):
         model_y=build_xgb(),
         model_t=build_xgb(),
         discrete_treatment=False,
-        n_estimators=1000,
+        n_estimators=800,
         min_samples_leaf=5,
         max_features="sqrt",
         inference=True,
@@ -976,32 +1043,32 @@ def run_causal_forest(df):
         random_state=SEED,
         n_jobs=1,
     )
-
     forest.fit(Y, T, X=X, W=W)
+
     effects = forest.effect(X)
     work["Estimated_Effect_CF"] = effects
 
     try:
-        lower, upper = forest.effect_interval(X, alpha=0.05)
-        work["Effect_Lower_95"] = lower
-        work["Effect_Upper_95"] = upper
+        low, high = forest.effect_interval(X, alpha=0.05)
+        work["Effect_Lower_95"] = low
+        work["Effect_Upper_95"] = high
     except Exception:
         pass
 
-    surrogate = None
+    surrogate = xgb.XGBRegressor(
+        n_estimators=300,
+        max_depth=2,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        objective="reg:squarederror",
+        random_state=SEED,
+        n_jobs=1,
+    )
+    surrogate.fit(X, effects)
+
     shap_values = None
     try:
-        surrogate = xgb.XGBRegressor(
-            n_estimators=300,
-            max_depth=2,
-            learning_rate=0.03,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="reg:squarederror",
-            random_state=SEED,
-            n_jobs=1,
-        )
-        surrogate.fit(X, effects)
         explainer = shap.TreeExplainer(surrogate)
         shap_values = explainer.shap_values(X)
     except Exception:
@@ -1022,7 +1089,7 @@ def run_causal_forest(df):
 
 
 # ============================================================
-# 15. WIZUALIZACJE / DIAGNOSTYKA
+# 14. WIZUALIZACJE / NAZWY
 # ============================================================
 
 DISPLAY_NAMES = {
@@ -1032,7 +1099,7 @@ DISPLAY_NAMES = {
     "Wzrost_PKB": "Wzrost realnego PKB",
     "Udzial_Przemyslu_GVA": "Udział przemysłu w WDB",
     "Produktywnosc": "WDB na 1 pracującego",
-    "Przecietne_Wynagrodzenie_Regionalne": "Regionalne przeciętne wynagrodzenie",
+    "Przecietne_Wynagrodzenie_Regionalne": "Przeciętne wynagrodzenie regionalne",
     "Placa_Minimalna": "Płaca minimalna",
 }
 
@@ -1043,41 +1110,19 @@ def nice_num(value, digits=4):
     return f"{value:.{digits}f}"
 
 
-def plot_shap(cf_result):
-    values = cf_result["shap_values"]
-    if values is None:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.text(
-            0.5,
-            0.5,
-            "Nie udało się obliczyć SHAP dla modelu zastępczego.",
-            ha="center",
-            va="center",
-        )
-        ax.axis("off")
-        return fig
-
-    X = cf_result["X"].rename(columns=DISPLAY_NAMES)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    shap.summary_plot(values, X, show=False, plot_size=None)
-    ax.set_title("SHAP – zmienne związane z heterogenicznością τ(x)")
-    fig.tight_layout()
-    return fig
-
-
-def diagnostics(df):
+def diagnostics_table(df):
     rows = []
-    for col in [
-        "Stopa_Zatrudnienia",
-        "Stopa_Bezrobocia_BAEL",
-        "Kaitz_Index",
-        "Wzrost_PKB",
-        "Udzial_Przemyslu_GVA",
-        "Produktywnosc",
-    ]:
+    cols = [
+        "Stopa_Zatrudnienia", "Stopa_Bezrobocia_BAEL", "Kaitz_Index",
+        "Wzrost_PKB", "Udzial_Przemyslu_GVA", "Produktywnosc",
+    ]
+    for col in cols:
+        if col not in df.columns:
+            continue
         rows.append({
             "Zmienna": DISPLAY_NAMES.get(col, col),
             "N": int(df[col].notna().sum()),
+            "Braki": int(df[col].isna().sum()),
             "Średnia": float(df[col].mean()),
             "Min": float(df[col].min()),
             "Max": float(df[col].max()),
@@ -1085,79 +1130,93 @@ def diagnostics(df):
     return pd.DataFrame(rows)
 
 
+def shap_figure(cf_result):
+    values = cf_result["shap_values"]
+    if values is None:
+        return None
+    X = cf_result["X"].rename(columns=DISPLAY_NAMES)
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(values, X, show=False, plot_size=None)
+    fig = plt.gcf()
+    fig.suptitle("SHAP – zmienne związane z heterogenicznością τ(x)", y=1.02)
+    fig.tight_layout()
+    return fig
+
+
 # ============================================================
-# 16. START APLIKACJI
+# 15. START
 # ============================================================
 
 st.title("📊 Wpływ płacy minimalnej na zatrudnienie w województwach")
 st.caption(
     "Panel regionalny Polski • BAEL • Rachunki regionalne GUS • "
-    "regionalny Kaitz • Pooled OLS / Two-Way FE / Causal Forest + DML"
+    "regionalny Kaitz • Two-Way FE • DML + Causal Forest"
 )
 
 paths = {key: detect_file(key) for key in REPOSITORY_FILES}
 
 st.sidebar.header("Źródła danych")
 for key, path in paths.items():
+    label = CORE_SOURCE_LABELS[key]
     if path is None:
-        st.sidebar.error(f"Brak: {REPOSITORY_FILES[key]}")
+        if key == "RACH_PRODUCTIVITY":
+            st.sidebar.info(f"Opcjonalne: {label}")
+        else:
+            st.sidebar.error(f"Brak: {label}")
     else:
         st.sidebar.success(path.name)
 
-required_keys = list(REPOSITORY_FILES.keys())
+required_keys = [
+    "RYNE_UNEMPLOYMENT",
+    "RYNE_EMPLOYMENT",
+    "WYNA_REGIONAL",
+    "RACH_GDP_GROWTH",
+    "RACH_GVA_SECTOR",
+]
 missing = [k for k in required_keys if paths[k] is None]
 if missing:
     st.error(
-        "Nie znaleziono wymaganych plików w repozytorium: "
-        + ", ".join(REPOSITORY_FILES[k] for k in missing)
+        "Nie znaleziono wymaganych plików w repozytorium:\n\n"
+        + "\n".join(REPOSITORY_FILES[k] for k in missing)
     )
     st.stop()
 
 st.sidebar.markdown("---")
-st.sidebar.caption(
-    "Dane są ładowane automatycznie z repozytorium. "
-    "Aplikacja nie wymaga ręcznego wgrywania plików."
-)
+st.sidebar.caption("Aplikacja korzysta bezpośrednio z plików znajdujących się w repozytorium. Nie ma ręcznego uploadu.")
 
 try:
-    with st.spinner("Wczytywanie i łączenie tabel GUS…"):
-        df = load_and_clean_data(
+    with st.spinner("Wczytywanie tabel GUS i budowa panelu…"):
+        df, data_diag, source_diag = load_and_clean_data(
             str(paths["RYNE_UNEMPLOYMENT"]),
             str(paths["RYNE_EMPLOYMENT"]),
             str(paths["WYNA_REGIONAL"]),
             str(paths["RACH_GDP_GROWTH"]),
             str(paths["RACH_GVA_SECTOR"]),
-            str(paths["RACH_PRODUCTIVITY"]),
+            str(paths["RACH_PRODUCTIVITY"]) if paths["RACH_PRODUCTIVITY"] else None,
         )
 except Exception as exc:
-    st.error(f"Błąd analizy danych: {exc}")
+    st.error("Błąd analizy danych")
     st.exception(exc)
     st.stop()
-
-# Szybka kontrola zmienności treatmentu.
-year_treat_variation = df.groupby("Rok")["Kaitz_Index"].nunique()
-if (year_treat_variation <= 1).mean() > 0.5:
-    st.warning(
-        "W ponad połowie lat Kaitz ma zbyt małą zmienność między województwami. "
-        "Sprawdź regionalne wynagrodzenia WYNA 2504."
-    )
 
 try:
-    with st.spinner("Estymacja OLS, Two-Way FE i Causal Forest + DML…"):
-        pooled, twfe = run_benchmark(df)
+    with st.spinner("Estymacja benchmarku i Causal Forest…"):
+        pooled, twfe, include_productivity, benchmark_df = run_benchmark(df)
         cf = run_causal_forest(df)
 except Exception as exc:
-    st.error(f"Błąd modelowania: {exc}")
+    st.error("Błąd modelowania")
     st.exception(exc)
     st.stop()
 
-st.sidebar.markdown("---")
 st.sidebar.metric("Obserwacje", len(df))
 st.sidebar.metric("Województwa", df["Wojewodztwo"].nunique())
-st.sidebar.metric("Zakres lat", f"{int(df['Rok'].min())}–{int(df['Rok'].max())}")
+st.sidebar.metric("Lata", f"{int(df['Rok'].min())}–{int(df['Rok'].max())}")
+st.sidebar.metric("Średni Kaitz", f"{df['Kaitz_Index'].mean():.3f}")
+if df["Wojewodztwo"].nunique() < 12 or df["Rok"].nunique() < 5:
+    st.sidebar.warning("Próba jest ograniczona przez dostępność danych GUS; interpretację wyników należy traktować ostrożnie.")
 
 # ============================================================
-# 17. TABS
+# 16. TABS
 # ============================================================
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -1165,39 +1224,36 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 Benchmark",
     "🌲 Causal Forest",
     "🔎 SHAP",
-    "ℹ️ Metodologia",
+    "🔧 Diagnostyka",
 ])
 
 with tab1:
     st.subheader("Finalny panel analityczny")
-
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Obserwacje", len(df))
     c2.metric("Województwa", df["Wojewodztwo"].nunique())
-    c3.metric("Lata", f"{int(df['Rok'].min())}–{int(df['Rok'].max())}")
+    c3.metric("Zakres", f"{int(df['Rok'].min())}–{int(df['Rok'].max())}")
     c4.metric("Średni Kaitz", f"{df['Kaitz_Index'].mean():.3f}")
 
-    shown_cols = [
-        "Wojewodztwo",
-        "Rok",
-        "Kaitz_Index",
+    shown = [
+        "Wojewodztwo", "Rok", "Kaitz_Index",
         "Przecietne_Wynagrodzenie_Regionalne",
-        "Stopa_Zatrudnienia",
-        "Stopa_Bezrobocia_BAEL",
-        "Wzrost_PKB",
-        "Udzial_Przemyslu_GVA",
-        "Produktywnosc",
+        "Stopa_Zatrudnienia", "Stopa_Bezrobocia_BAEL",
+        "Wzrost_PKB", "Udzial_Przemyslu_GVA",
     ]
+    if "Produktywnosc" in df.columns:
+        shown.append("Produktywnosc")
+
     st.dataframe(
-        df[shown_cols]
+        df[shown]
         .rename(columns=DISPLAY_NAMES)
         .sort_values(["Rok", "Wojewodztwo"]),
         use_container_width=True,
         hide_index=True,
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
+    left, right = st.columns(2)
+    with left:
         fig, ax = plt.subplots(figsize=(8, 5))
         sns.histplot(df["Kaitz_Index"], bins=18, kde=True, ax=ax)
         ax.set_title("Rozkład regionalnego Kaitz Index")
@@ -1206,7 +1262,7 @@ with tab1:
         fig.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
-    with col2:
+    with right:
         yearly = df.groupby("Rok", as_index=False)["Kaitz_Index"].mean()
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(yearly["Rok"], yearly["Kaitz_Index"], marker="o")
@@ -1217,13 +1273,10 @@ with tab1:
         fig.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
-    st.markdown("### Kontrola jakości")
-    st.dataframe(diagnostics(df), use_container_width=True, hide_index=True)
-
     st.info(
-        "Kaitz jest regionalny: krajowa płaca minimalna jest dzielona przez "
-        "przeciętne wynagrodzenie brutto w danym województwie. Dzięki temu "
-        "treatment ma zmienność między regionami i w czasie."
+        "W głównej próbie zakres lat jest wyznaczany automatycznie jako część wspólna "
+        "lat dostępnych w RYNE, WYNA i RACH. Dzięki temu brak obserwacji w jednym źródle "
+        "nie zeruje całego panelu tylko przez z góry narzucony zakres 2010–2025."
     )
 
 with tab2:
@@ -1236,7 +1289,10 @@ with tab2:
         st.metric("Two-Way FE – Kaitz", nice_num(twfe.params.get("Kaitz_Index")))
         st.caption("Efekty stałe województw i lat; SE klastrowane po województwie.")
 
-    st.markdown("### Wyniki Two-Way FE")
+    st.caption(
+        "W benchmarku zmienna Produktywnosc jest uwzględniana tylko wtedy, gdy ma "
+        "co najmniej 85% kompletnych obserwacji."
+    )
     st.text(twfe.summary())
 
 with tab3:
@@ -1244,111 +1300,85 @@ with tab3:
     a, b, c = st.columns(3)
     a.metric("Średni efekt τ(x)", nice_num(cf["ate"]))
     b.metric("Mediana τ(x)", nice_num(cf["median"]))
-    c.metric("Odchylenie τ(x)", nice_num(cf["std"]))
+    c.metric("SD τ(x)", nice_num(cf["std"]))
 
-    col1, col2 = st.columns(2)
-    with col1:
-        regional = (
-            cf["df"].groupby("Wojewodztwo")["Estimated_Effect_CF"]
-            .mean()
-            .sort_values()
-        )
+    left, right = st.columns(2)
+    with left:
+        regional = cf["df"].groupby("Wojewodztwo")["Estimated_Effect_CF"].mean().sort_values()
         fig, ax = plt.subplots(figsize=(7, 8))
-        sns.barplot(x=regional.values, y=regional.index, ax=ax)
+        ax.barh(regional.index, regional.values)
         ax.axvline(0, color="black", linestyle="--", linewidth=1)
         ax.set_xlabel("Średni estymowany efekt τ(x)")
-        ax.set_ylabel("")
         ax.set_title("Heterogeniczność efektu między województwami")
         fig.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
-    with col2:
+    with right:
         plot_df = cf["df"].copy()
         fig, ax = plt.subplots(figsize=(7, 6))
-        scatter = ax.scatter(
+        ax.scatter(
             plot_df["Stopa_Bezrobocia_BAEL"],
             plot_df["Estimated_Effect_CF"],
-            c=plot_df["Kaitz_Index"],
             alpha=0.75,
         )
         ax.axhline(0, color="black", linestyle="--", linewidth=1)
         ax.set_xlabel("Stopa bezrobocia BAEL")
         ax.set_ylabel("Estymowany efekt τ(x)")
         ax.set_title("Heterogeniczność a warunki rynku pracy")
-        cb = fig.colorbar(scatter, ax=ax)
-        cb.set_label("Kaitz Index")
         fig.tight_layout()
         st.pyplot(fig, clear_figure=True)
 
-    result_cols = [
-        "Wojewodztwo",
-        "Rok",
-        "Kaitz_Index",
-        "Stopa_Bezrobocia_BAEL",
-        "Wzrost_PKB",
-        "Udzial_Przemyslu_GVA",
-        "Produktywnosc",
-        "Estimated_Effect_CF",
-    ]
-    if "Effect_Lower_95" in cf["df"].columns:
-        result_cols += ["Effect_Lower_95", "Effect_Upper_95"]
-    st.dataframe(
-        cf["df"][result_cols].sort_values("Estimated_Effect_CF"),
-        use_container_width=True,
-        hide_index=True,
+    st.info(
+        "SHAP i wykresy heterogeniczności opisują zmienność estymowanego τ(x). "
+        "Nie należy interpretować wartości SHAP jako dodatkowych efektów przyczynowych."
     )
 
 with tab4:
-    st.subheader("SHAP – interpretacja heterogeniczności")
-    st.markdown(
-        "SHAP pokazuje, które cechy są związane z różnicami w estymowanym "
-        "efekcie τ(x). Nie należy go interpretować jako dodatkowego efektu przyczynowego."
+    st.subheader("SHAP – heterogeniczność efektu")
+    fig = shap_figure(cf)
+    if fig is None:
+        st.warning("Nie udało się policzyć SHAP dla modelu zastępczego.")
+    else:
+        st.pyplot(fig, clear_figure=True)
+    st.caption(
+        "Model zastępczy XGBoost aproksymuje przewidywany efekt τ(x) z Causal Forest. "
+        "SHAP wskazuje, które cechy są związane z różnicami w τ(x)."
     )
-    fig = plot_shap(cf)
-    st.pyplot(fig, clear_figure=True)
-
-    if cf["shap_values"] is not None:
-        values = np.asarray(cf["shap_values"])
-        importance = pd.DataFrame({
-            "Zmienna": cf["x_cols"],
-            "Średnia |SHAP|": np.mean(np.abs(values), axis=0),
-        }).sort_values("Średnia |SHAP|", ascending=False)
-        importance["Zmienna"] = importance["Zmienna"].map(
-            lambda x: DISPLAY_NAMES.get(x, x)
-        )
-        st.dataframe(importance, use_container_width=True, hide_index=True)
 
 with tab5:
-    st.subheader("Metodologia")
-    st.markdown(
-        """
-**Treatment:** regionalny Kaitz Index = płaca minimalna / przeciętne regionalne wynagrodzenie brutto.
+    st.subheader("Diagnostyka danych")
+    st.write("**Wspólne lata rdzenia:**", data_diag["common_years"])
 
-**Outcome:** wskaźnik zatrudnienia według BAEL.
+    st.markdown("### Zakresy lat według źródła")
+    year_rows = []
+    for source, years in data_diag["source_years"].items():
+        year_rows.append({
+            "Źródło": source,
+            "Pierwszy rok": min(years) if years else None,
+            "Ostatni rok": max(years) if years else None,
+            "Liczba lat": len(years),
+            "Lata": ", ".join(map(str, years)),
+        })
+    st.dataframe(pd.DataFrame(year_rows), use_container_width=True, hide_index=True)
 
-**Heterogeniczność:** stopa bezrobocia BAEL, wzrost realnego PKB, udział przemysłu (sekcje B–E) w wartości dodanej brutto oraz WDB na 1 pracującego.
-
-**Benchmark:** Pooled OLS oraz Two-Way Fixed Effects z efektami stałymi województw i lat.
-
-**Causal ML:** Double Machine Learning z XGBoost jako modelami nuisance oraz Causal Forest do estymacji zróżnicowanego efektu τ(x).
-
-**SHAP:** interpretacja tego, które zmienne są związane z heterogenicznością oszacowanego efektu.
-
-**H5:** zatrudnienie młodzieży jest wyłączone z głównej analizy.
-        """
-    )
-    st.info(
-        "RACH 3498 (poziom nominalnego PKB) i CENY 2496 nie są wymagane do estymacji modelu głównego. "
-        "RACH 3502 dostarcza bezpośrednio dynamikę realnego PKB, a Kaitz jest relacją dwóch płac, "
-        "więc wspólny deflator CPI nie zmienia jego wartości. Dzięki temu aplikacja nie uzależnia "
-        "wyniku od dodatkowego etapu deflacji. "
+    st.markdown("### Panel po połączeniu")
+    st.write(
+        f"Województwa: **{data_diag['n_regions']}**, "
+        f"lata: **{data_diag['n_years']}**, "
+        f"obserwacje: **{len(df)}**."
     )
 
-    st.warning(
-        "Wyniki wymagają założeń identyfikacyjnych typowych dla danych obserwacyjnych. "
-        "Causal Forest nie eliminuje automatycznie obciążenia wynikającego z nieobserwowanych czynników. "
-        "Przy 16 województwach należy też ostrożnie traktować wnioskowanie oparte na klastrowanych SE."
-    )
-    st.markdown("### Pliki używane przez aplikację")
-    for key, path in paths.items():
-        st.write(f"**{key}:** {path.name}")
+    st.markdown("### Kompletność zmiennych")
+    st.dataframe(diagnostics_table(df), use_container_width=True, hide_index=True)
+
+    st.markdown("### Kontrola zmian liczby obserwacji przy scalaniu")
+    st.dataframe(pd.DataFrame(data_diag["merge_log"]), use_container_width=True, hide_index=True)
+
+    st.markdown("### Status opcjonalnej produktywności")
+    prod_status = source_diag.get("RACH_3510", {})
+    if "error" in prod_status:
+        st.warning("RACH 3510 nie został użyty jako zmienna opcjonalna: " + str(prod_status["error"]))
+    elif prod_status:
+        st.success("RACH 3510 odczytany; zmienna jest używana tylko przy wysokiej kompletności.")
+    else:
+        st.info("Plik RACH 3510 nie został znaleziony – nie jest wymagany do działania aplikacji.")
