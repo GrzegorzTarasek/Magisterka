@@ -63,8 +63,11 @@ WOJEWODZTWA_MAP = {
 }
 
 COLUMN_ALIASES = {
-    "Kod": ["Kod", "kod", "Kod teryt", "Kod_TERYT", "id"],
-    "Rok": ["Rok", "rok", "Year", "TIME"],
+    "Kod": [
+        "Kod", "kod", "Kod teryt", "Kod_TERYT",
+        "Kod jednostki terytorialnej", "Kod terytorialny", "id", "ID",
+    ],
+    "Rok": ["Rok", "rok", "Year", "YEAR", "TIME", "Okres"],
     "Stopa_Zatrudnienia": [
         "Stopa_Zatrudnienia", "Wskaźnik zatrudnienia",
         "Wskaznik zatrudnienia", "Wskaźnik zatrudnienia w wieku 15-64",
@@ -72,15 +75,20 @@ COLUMN_ALIASES = {
     ],
     "Bezrobocie_Rejestrowane": [
         "Bezrobocie_Rejestrowane", "Stopa bezrobocia (BAEL)",
-        "Stopa bezrobocia", "Stopa bezrobocia (BAEL)",
-        "Registered unemployment rate",
+        "Stopa bezrobocia", "Registered unemployment rate",
     ],
     "PKB_Nominalny": [
         "PKB_Nominalny", "PKB", "Produkt krajowy brutto",
         "Produkt krajowy brutto (ceny bieżące)",
     ],
+    "Realny_PKB": [
+        "Realny_PKB", "Produkt krajowy brutto (ceny stałe)",
+        "Produkt krajowy brutto - ceny stałe", "PKB w cenach stałych",
+        "PKB realny",
+    ],
     "Realny_PKB_per_capita": [
         "Realny_PKB_per_capita", "PKB na 1 mieszkańca",
+        "PKB na 1 mieszkańca (ceny stałe)",
         "PKB na 1 mieszkańca (ceny bieżące)",
         "PKB per capita", "PKB na mieszkańca",
     ],
@@ -112,27 +120,38 @@ COLUMN_ALIASES = {
 # ============================================================
 
 def normalize_col_name(value):
-    value = str(value).strip()
+    value = str(value).replace("\ufeff", "").strip()
     value = re.sub(r"\s+", " ", value)
     return value
+
+
+def _is_year_like(value):
+    text_value = normalize_col_name(value)
+    return bool(re.fullmatch(r"(?:19|20)\d{2}", text_value))
 
 
 def find_column(df, canonical_name, required=True):
     aliases = COLUMN_ALIASES.get(canonical_name, [canonical_name])
 
     normalized = {normalize_col_name(c): c for c in df.columns}
+    normalized_lower = {k.lower(): v for k, v in normalized.items()}
 
     for alias in aliases:
         alias_n = normalize_col_name(alias)
         if alias_n in normalized:
             return normalized[alias_n]
+        if alias_n.lower() in normalized_lower:
+            return normalized_lower[alias_n.lower()]
 
-    lower_cols = {str(c).lower(): c for c in df.columns}
-    for alias in aliases:
-        a = str(alias).lower()
-        for col_lower, col in lower_cols.items():
-            if a in col_lower or col_lower in a:
-                return col
+    # Dla Rok nie stosujemy dopasowania częściowego, ponieważ nazwy
+    # szerokich kolumn zawierają lata (np. 2021) i nie chcemy fałszywego trafienia.
+    if canonical_name != "Rok":
+        for alias in aliases:
+            a = normalize_col_name(alias).lower()
+            for col in df.columns:
+                c = normalize_col_name(col).lower()
+                if a and (a in c or c in a):
+                    return col
 
     if required:
         raise ValueError(
@@ -154,16 +173,109 @@ def rename_to_canonical(df, canonical_names):
     return out.rename(columns=rename_map)
 
 
+def _find_excel_header(path, sheet_name, max_rows=80):
+    raw = pd.read_excel(
+        path,
+        sheet_name=sheet_name,
+        header=None,
+        engine="openpyxl",
+        nrows=max_rows,
+    )
+
+    best_row = None
+    best_score = -1
+
+    for i in range(len(raw)):
+        values = [normalize_col_name(v) for v in raw.iloc[i].tolist()]
+        lower = [v.lower() for v in values]
+        nonempty = [v for v in values if v and v.lower() != "nan"]
+
+        has_kod = any(
+            v == "kod"
+            or v.startswith("kod ")
+            or v in {"kod_teryt", "kod teryt"}
+            for v in lower
+        )
+        has_name = any(
+            v == "nazwa"
+            or v.startswith("nazwa ")
+            for v in lower
+        )
+        year_count = sum(_is_year_like(v) for v in nonempty)
+
+        score = year_count * 10 + min(len(nonempty), 50)
+        if has_name:
+            score += 100
+        if has_kod:
+            score += 1000
+
+        if has_kod and score > best_score:
+            best_row = i
+            best_score = score
+
+    return best_row
+
+
+def read_excel_gus(path):
+    """Czyta XLSX z eksportu GUS, także gdy nad tabelą są wiersze metadanych."""
+    xls = pd.ExcelFile(path, engine="openpyxl")
+    candidates = []
+
+    for sheet in xls.sheet_names:
+        try:
+            header_row = _find_excel_header(path, sheet)
+            if header_row is None:
+                continue
+
+            df = pd.read_excel(
+                path,
+                sheet_name=sheet,
+                header=header_row,
+                engine="openpyxl",
+            )
+            df.columns = [normalize_col_name(c) for c in df.columns]
+            df = df.loc[:, ~df.columns.duplicated()].copy()
+
+            kod_col = find_column(df, "Kod", required=False)
+            name_col = next(
+                (c for c in df.columns if normalize_col_name(c).lower() == "nazwa"),
+                None,
+            )
+            year_count = sum(_is_year_like(c) for c in df.columns)
+
+            score = 0
+            if kod_col is not None:
+                score += 1000
+            if name_col is not None:
+                score += 200
+            score += year_count * 10
+            score += min(df.shape[1], 50)
+
+            candidates.append((score, df))
+        except Exception:
+            continue
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    raise ValueError(
+        f"Nie znaleziono właściwej tabeli w pliku XLSX '{Path(path).name}'. "
+        "Nie odnaleziono wiersza nagłówka zawierającego kolumnę Kod. "
+        "Sprawdź strukturę eksportu GUS."
+    )
+
+
 def read_table(path):
     path = str(path)
     suffix = Path(path).suffix.lower()
 
-    if suffix in {".xlsx", ".xls", ".xlsm"}:
-        return pd.read_excel(path)
+    if suffix in {".xlsx", ".xlsm", ".xls"}:
+        return read_excel_gus(path)
 
     if suffix == ".csv":
-        errors = []
-        for encoding in ["utf-8-sig", "utf-8", "cp1250", "latin1"]:
+        attempts = []
+        for encoding in ["utf-8-sig", "utf-8", "cp1250", "windows-1250", "latin1"]:
             for sep in [";", ",", "\t"]:
                 try:
                     df = pd.read_csv(
@@ -172,15 +284,18 @@ def read_table(path):
                         sep=sep,
                         low_memory=False,
                     )
-                    if df.shape[1] > 1:
+                    df.columns = [normalize_col_name(c) for c in df.columns]
+                    if find_column(df, "Kod", required=False) is not None:
                         return df
-                except Exception as exc:
-                    errors.append(str(exc))
+                    if df.shape[1] > 2:
+                        attempts.append(df)
+                except Exception:
+                    continue
 
-        raise ValueError(
-            f"Nie udało się odczytać pliku CSV: {path}. "
-            f"Ostatni błąd: {errors[-1] if errors else 'nieznany'}"
-        )
+        if attempts:
+            return max(attempts, key=lambda d: d.shape[1])
+
+        raise ValueError(f"Nie udało się odczytać pliku CSV: {path}")
 
     raise ValueError(f"Nieobsługiwany format pliku: {path}")
 
