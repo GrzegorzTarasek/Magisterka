@@ -67,8 +67,8 @@ COLUMN_ALIASES = {
         "Wskaźnik zatrudnienia (15-64)", "Employment rate",
     ],
     "Bezrobocie_Rejestrowane": [
-        "Bezrobocie_Rejestrowane", "Stopa bezrobocia rejestrowanego",
-        "Stopa bezrobocia", "Bezrobocie rejestrowane",
+        "Bezrobocie_Rejestrowane", "Stopa bezrobocia (BAEL)",
+        "Stopa bezrobocia", "Stopa bezrobocia (BAEL)",
         "Registered unemployment rate",
     ],
     "PKB_Nominalny": [
@@ -182,10 +182,16 @@ def read_table(path):
 
 
 REPOSITORY_FILES = {
-    "RYNE": "RYNE_4098_CTAB_20261006234440.csv",
-    "RACH": "RACH_3510_XTAB_20261007010935.xlsx",
+    "RYNE_SECTOR": "RYNE_4098_CTAB_20261006234440.csv",
+    "RYNE_UNEMPLOYMENT": "RYNE_4100_CTAB_20261006234212.csv",
+    "RYNE_EMPLOYMENT": "RYNE_4112_CTAB_20261006234336.csv",
+    "RYNE_NEET": "RYNE_4498_CTAB_20261006234519.csv",  # H5 - celowo niewykorzystywany
+    "RACH_GDP_NOMINAL": "RACH_3498_XTAB_20261007010718.xlsx",
+    "RACH_GDP_REAL": "RACH_3502_XTAB_20261007010836.xlsx",
+    "RACH_GDP_REAL_PC": "RACH_3503_XTAB_20261007010812.xlsx",
     "CENY": "CENY_2496_XTAB_20261007223438.xlsx",
 }
+
 
 def detect_file(prefix):
     prefix = prefix.upper()
@@ -196,8 +202,6 @@ def detect_file(prefix):
         if exact_path.exists():
             return str(exact_path)
 
-    # Fallback: if the exact repository filename changes in a later commit,
-    # find another file with the same GUS dataset prefix.
     matches = sorted(
         p for p in APP_DIR.iterdir()
         if p.is_file()
@@ -207,8 +211,6 @@ def detect_file(prefix):
 
     return str(matches[-1]) if matches else None
 
-
-APP_DIR = Path(__file__).resolve().parent
 
 def get_local_data_files():
     extensions = {".csv", ".xlsx", ".xls", ".xlsm"}
@@ -244,99 +246,411 @@ def extract_teryt(code):
 # 3. PRZYGOTOWANIE PANELU
 # ============================================================
 
+def find_year_columns(df, year, include=None, exclude=None):
+    """Znajduje kolumny GUS w szerokim układzie zawierające dany rok."""
+    include = include or []
+    exclude = exclude or []
+    year = str(year)
+    result = []
+
+    for col in df.columns:
+        name = normalize_col_name(col).lower()
+        if year not in name:
+            continue
+        if include and not all(str(x).lower() in name for x in include):
+            continue
+        if exclude and any(str(x).lower() in name for x in exclude):
+            continue
+        result.append(col)
+
+    return result
+
+
+def select_gus_wide_column(df, year, include_groups, preferred_groups=None, exclude=None):
+    """Wybiera najlepszą kolumnę wartości dla danego roku z tabeli GUS."""
+    exclude = exclude or ["wskaźnik precyzji", "precyzji"]
+    preferred_groups = preferred_groups or []
+
+    candidates = find_year_columns(
+        df,
+        year,
+        include=[],
+        exclude=exclude,
+    )
+
+    def score(col):
+        name = normalize_col_name(col).lower()
+        score_value = 0
+        for group in include_groups:
+            group = str(group).lower()
+            if group in name:
+                score_value += 10
+        for group in preferred_groups:
+            group = str(group).lower()
+            if group in name:
+                score_value += 100
+        if "wartość liczbowa" in name:
+            score_value += 30
+        if "ogółem" in name:
+            score_value += 50
+        return score_value
+
+    if not candidates:
+        return None
+
+    candidates = sorted(candidates, key=score, reverse=True)
+    return candidates[0]
+
+
+def wide_gus_to_long(df, value_name, selector, years=None):
+    """Konwertuje szeroką tabelę GUS Kod/Nazwa + kolumny roczne do panelu Kod/Rok."""
+    years = years or range(2010, 2026)
+    rows = []
+
+    kod_col = find_column(df, "Kod", required=True)
+
+    for year in years:
+        col = selector(df, year)
+        if col is None:
+            continue
+
+        part = df[[kod_col, col]].copy()
+        part.columns = ["Kod", value_name]
+        part["Rok"] = int(year)
+        rows.append(part)
+
+    if not rows:
+        raise ValueError(
+            f"Nie udało się znaleźć żadnych kolumn rocznych dla zmiennej '{value_name}'. "
+            f"Dostępne kolumny: {list(df.columns)}"
+        )
+
+    out = pd.concat(rows, ignore_index=True)
+    out["Kod"] = out["Kod"].astype(str).str.strip()
+    out[value_name] = pd.to_numeric(
+        out[value_name].astype(str)
+        .str.replace("\\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    return out.drop_duplicates(["Kod", "Rok"])
+
+
+def make_year_panel_from_ryne(ryne_sector, ryne_unemployment, ryne_employment):
+    """Buduje wspólny panel z trzech tabel RYNE w formacie szerokim."""
+
+    def sector_selector(df, year):
+        # RYNE 4098: odsetek pracujących wg sektorów ekonomicznych i płci.
+        # Bierzemy sektor przemysłowy, ogółem, wartość liczbowa.
+        exact = [
+            c for c in df.columns
+            if normalize_col_name(c).lower()
+            == f"sektor przemysłowy;ogółem;wartość liczbowa;{year};[%]".lower()
+        ]
+        if exact:
+            return exact[0]
+
+        return select_gus_wide_column(
+            df,
+            year,
+            include_groups=["sektor przemysłowy", "wartość liczbowa"],
+            preferred_groups=["ogółem"],
+        )
+
+    def employment_selector(df, year):
+        # RYNE 4112: wskaźnik zatrudnienia wg wieku i płci.
+        # Preferujemy ogółem i grupę 15-64, a następnie 15-89.
+        candidates = find_year_columns(
+            df,
+            year,
+            exclude=["wskaźnik precyzji", "precyzji"],
+        )
+        candidates = [
+            c for c in candidates
+            if "wartość liczbowa" in normalize_col_name(c).lower()
+        ]
+
+        preference = [
+            ["15-64", "ogółem"],
+            ["15-89", "ogółem"],
+            ["18-59/64", "ogółem"],
+            ["ogółem"],
+        ]
+
+        for pref in preference:
+            matches = [
+                c for c in candidates
+                if all(x.lower() in normalize_col_name(c).lower() for x in pref)
+            ]
+            if matches:
+                return matches[0]
+
+        return candidates[0] if candidates else None
+
+    def unemployment_selector(df, year):
+        # RYNE 4100: stopa bezrobocia wg wieku.
+        # Preferujemy ogółem dla grupy 15-74, następnie 15-89.
+        candidates = find_year_columns(
+            df,
+            year,
+            exclude=["wskaźnik precyzji", "precyzji"],
+        )
+        candidates = [
+            c for c in candidates
+            if "wartość liczbowa" in normalize_col_name(c).lower()
+        ]
+
+        preference = [
+            ["15-74", "ogółem"],
+            ["15-89", "ogółem"],
+            ["ogółem"],
+        ]
+
+        for pref in preference:
+            matches = [
+                c for c in candidates
+                if all(x.lower() in normalize_col_name(c).lower() for x in pref)
+            ]
+            if matches:
+                return matches[0]
+
+        return candidates[0] if candidates else None
+
+    sector = wide_gus_to_long(
+        ryne_sector,
+        "Udzial_Przemyslu",
+        sector_selector,
+        years=range(2021, 2026),
+    )
+
+    employment = wide_gus_to_long(
+        ryne_employment,
+        "Stopa_Zatrudnienia",
+        employment_selector,
+        years=range(2010, 2026),
+    )
+
+    unemployment = wide_gus_to_long(
+        ryne_unemployment,
+        "Bezrobocie_Rejestrowane",
+        unemployment_selector,
+        years=range(2010, 2025),
+    )
+
+    out = employment.merge(
+        unemployment,
+        on=["Kod", "Rok"],
+        how="inner",
+    )
+
+    out = out.merge(
+        sector,
+        on=["Kod", "Rok"],
+        how="inner",
+    )
+
+    return out
+
+
+def reshape_rach_series(df, value_name, selector, years=range(2010, 2025)):
+    kod_col = find_column(df, "Kod", required=True)
+    rows = []
+    for year in years:
+        col = selector(df, year)
+        if col is None:
+            continue
+        part = df[[kod_col, col]].copy()
+        part.columns = ["Kod", value_name]
+        part["Rok"] = int(year)
+        rows.append(part)
+
+    if not rows:
+        raise ValueError(
+            f"Nie znaleziono danych RACH dla zmiennej '{value_name}'. "
+            f"Dostępne kolumny: {list(df.columns)}"
+        )
+
+    out = pd.concat(rows, ignore_index=True)
+    out["Kod"] = out["Kod"].astype(str).str.strip()
+    out[value_name] = pd.to_numeric(
+        out[value_name].astype(str)
+        .str.replace("\\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    return out.drop_duplicates(["Kod", "Rok"])
+
+
+def rach_selector(df, year, keywords, preferred=None, exclude=None):
+    return select_gus_wide_column(
+        df,
+        year,
+        include_groups=keywords,
+        preferred_groups=preferred or [],
+        exclude=exclude or ["wskaźnik precyzji", "precyzji"],
+    )
+
+
+def build_rach_panel(rach_nominal, rach_real, rach_real_pc):
+    """Buduje panel RACH z właściwych tabel GUS:
+    3498 = PKB nominalne ogółem,
+    3502 = PKB realne ogółem,
+    3503 = PKB realne na 1 mieszkańca.
+    """
+
+    def nominal_selector(df, year):
+        candidates = find_year_columns(df, year, exclude=["dynamika", "wskaźnik"])
+        preferred = [
+            c for c in candidates
+            if "produkt krajowy brutto" in normalize_col_name(c).lower()
+            and "ogółem" in normalize_col_name(c).lower()
+        ]
+        return preferred[0] if preferred else (
+            candidates[0] if candidates else None
+        )
+
+    def real_selector(df, year):
+        candidates = find_year_columns(df, year, exclude=["dynamika", "wskaźnik"])
+        preferred = [
+            c for c in candidates
+            if "produkt krajowy brutto" in normalize_col_name(c).lower()
+            and "ogółem" in normalize_col_name(c).lower()
+        ]
+        return preferred[0] if preferred else (
+            candidates[0] if candidates else None
+        )
+
+    def real_pc_selector(df, year):
+        candidates = find_year_columns(df, year, exclude=["dynamika", "wskaźnik"])
+        preferred = [
+            c for c in candidates
+            if "produkt krajowy brutto" in normalize_col_name(c).lower()
+            and "1 mieszkańca" in normalize_col_name(c).lower()
+        ]
+        return preferred[0] if preferred else (
+            candidates[0] if candidates else None
+        )
+
+    nominal = reshape_rach_series(
+        rach_nominal,
+        "PKB_Nominalny",
+        nominal_selector,
+        years=range(2010, 2025),
+    )
+
+    real = reshape_rach_series(
+        rach_real,
+        "Realny_PKB",
+        real_selector,
+        years=range(2010, 2025),
+    )
+
+    real_pc = reshape_rach_series(
+        rach_real_pc,
+        "Realny_PKB_per_capita",
+        real_pc_selector,
+        years=range(2010, 2025),
+    )
+
+    out = nominal.merge(real, on=["Kod", "Rok"], how="inner")
+    out = out.merge(real_pc, on=["Kod", "Rok"], how="inner")
+    return out
+
+
+def reshape_ceny_file(ceny_df):
+    """Obsługuje CENY w układzie klasycznym lub szerokim."""
+    rok_col = find_column(ceny_df, "Rok", required=False)
+    cpi_col = find_column(ceny_df, "Wskaznik_CPI", required=False)
+
+    if rok_col is not None and cpi_col is not None:
+        out = ceny_df[[rok_col, cpi_col]].copy()
+        out.columns = ["Rok", "Wskaznik_CPI"]
+        return out
+
+    # W szerokim eksporcie GUS rok może być elementem nazwy kolumny.
+    candidates = []
+    for col in ceny_df.columns:
+        name = normalize_col_name(col).lower()
+        if any(token in name for token in ["wskaźnik", "cpi", "ceny towarów"]):
+            candidates.append(col)
+
+    if not candidates:
+        # Ostatnia próba: kolumny zawierające rok i 100 jako bazę.
+        candidates = [
+            c for c in ceny_df.columns
+            if any(str(y) in normalize_col_name(c) for y in range(2010, 2026))
+        ]
+
+    rows = []
+    for year in range(2010, 2026):
+        year_cols = [c for c in candidates if str(year) in normalize_col_name(c)]
+        if not year_cols:
+            continue
+        col = year_cols[0]
+        part = pd.DataFrame({
+            "Rok": [year] * len(ceny_df),
+            "Wskaznik_CPI": ceny_df[col].values,
+        })
+        rows.append(part)
+
+    if not rows:
+        raise ValueError(
+            "Nie udało się rozpoznać rocznych wartości CPI w pliku CENY. "
+            f"Dostępne kolumny: {list(ceny_df.columns)}"
+        )
+
+    out = pd.concat(rows, ignore_index=True)
+    out["Wskaznik_CPI"] = pd.to_numeric(
+        out["Wskaznik_CPI"].astype(str)
+        .str.replace("\\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    return out
+
+
 @st.cache_data(show_spinner=False)
-def load_and_clean_data(ryne_path, rach_path, ceny_path):
-    ryne_df = read_table(ryne_path)
-    rach_df = read_table(rach_path)
+def load_and_clean_data(
+    ryne_sector_path,
+    ryne_unemployment_path,
+    ryne_employment_path,
+    rach_nominal_path,
+    rach_real_path,
+    rach_real_pc_path,
+    ceny_path,
+):
+    ryne_sector_df = read_table(ryne_sector_path)
+    ryne_unemployment_df = read_table(ryne_unemployment_path)
+    ryne_employment_df = read_table(ryne_employment_path)
+    rach_nominal_df = read_table(rach_nominal_path)
+    rach_real_df = read_table(rach_real_path)
+    rach_real_pc_df = read_table(rach_real_pc_path)
     ceny_df = read_table(ceny_path)
 
-    ryne_df = rename_to_canonical(
-        ryne_df,
-        [
-            "Kod", "Rok", "Stopa_Zatrudnienia",
-            "Bezrobocie_Rejestrowane",
-            "Zatrudnieni_Ogolem", "Populacja",
-        ],
+    ryne_df = make_year_panel_from_ryne(
+        ryne_sector_df,
+        ryne_unemployment_df,
+        ryne_employment_df,
     )
 
-    rach_df = rename_to_canonical(
-        rach_df,
-        [
-            "Kod", "Rok", "PKB_Nominalny",
-            "Realny_PKB_per_capita",
-            "WDB_Przemysl", "WDB_Ogolem",
-        ],
+    rach_df = build_rach_panel(
+        rach_nominal_df,
+        rach_real_df,
+        rach_real_pc_df,
     )
+    ceny_df = reshape_ceny_file(ceny_df)
 
-    ceny_df = rename_to_canonical(
-        ceny_df,
-        ["Rok", "Wskaznik_CPI"],
-    )
-
-    required_ryne = [
-        "Kod", "Rok", "Stopa_Zatrudnienia",
-        "Bezrobocie_Rejestrowane",
-    ]
-    required_rach = [
-        "Kod", "Rok", "PKB_Nominalny",
-        "WDB_Przemysl", "WDB_Ogolem",
-    ]
-    required_ceny = ["Rok", "Wskaznik_CPI"]
-
-    for c in required_ryne:
-        find_column(ryne_df, c, required=True)
-    for c in required_rach:
-        find_column(rach_df, c, required=True)
-    for c in required_ceny:
-        find_column(ceny_df, c, required=True)
-
-    if "Populacja" not in ryne_df.columns:
-        ryne_df["Populacja"] = np.nan
-
-    if "Zatrudnieni_Ogolem" not in ryne_df.columns:
-        ryne_df["Zatrudnieni_Ogolem"] = np.nan
-
-    if "Realny_PKB_per_capita" not in rach_df.columns:
-        rach_df["Realny_PKB_per_capita"] = np.nan
-
+    # Jeśli RACH ma tylko PKB i per capita, udział przemysłu pochodzi z RYNE.
+    # Łączenie następuje po województwie/kodzie i roku.
     for frame in [ryne_df, rach_df]:
-        frame["Rok"] = pd.to_numeric(
-            frame["Rok"], errors="coerce"
-        ).astype("Int64")
         frame["Kod"] = frame["Kod"].astype(str).str.strip()
+        frame["Kod_Str"] = frame["Kod"].map(extract_teryt)
 
-    ceny_df["Rok"] = pd.to_numeric(
-        ceny_df["Rok"], errors="coerce"
-    ).astype("Int64")
-
-    ryne_df = coerce_numeric(
-        ryne_df,
-        [
-            "Stopa_Zatrudnienia",
-            "Bezrobocie_Rejestrowane",
-            "Zatrudnieni_Ogolem",
-            "Populacja",
-        ],
-    )
-
-    rach_df = coerce_numeric(
-        rach_df,
-        [
-            "PKB_Nominalny",
-            "Realny_PKB_per_capita",
-            "WDB_Przemysl",
-            "WDB_Ogolem",
-        ],
-    )
-
-    ceny_df = coerce_numeric(
-        ceny_df,
-        ["Wskaznik_CPI"],
-    )
-
-    ryne_df = ryne_df.drop_duplicates(["Kod", "Rok"])
     rach_df = rach_df.drop_duplicates(["Kod", "Rok"])
-    ceny_df = ceny_df.drop_duplicates(["Rok"])
+    ryne_df = ryne_df.drop_duplicates(["Kod", "Rok"])
 
     df = ryne_df.merge(
         rach_df,
@@ -345,13 +659,14 @@ def load_and_clean_data(ryne_path, rach_path, ceny_path):
         suffixes=("", "_rach"),
     )
 
-    df = df.merge(
-        ceny_df,
-        on=["Rok"],
-        how="inner",
+    ceny_df["Rok"] = pd.to_numeric(ceny_df["Rok"], errors="coerce")
+    ceny_df["Wskaznik_CPI"] = pd.to_numeric(
+        ceny_df["Wskaznik_CPI"], errors="coerce"
     )
+    ceny_df = ceny_df.drop_duplicates(["Rok"])
 
-    df["Kod_Str"] = df["Kod"].map(extract_teryt)
+    df = df.merge(ceny_df, on="Rok", how="inner")
+
     df["Wojewodztwo"] = df["Kod_Str"].map(WOJEWODZTWA_MAP)
     df = df[df["Wojewodztwo"].notna()].copy()
 
@@ -360,27 +675,18 @@ def load_and_clean_data(ryne_path, rach_path, ceny_path):
     )
     df["Placa_Minimalna"] = df["Rok"].map(MIN_WAGE_PL)
 
-    df["CPI"] = pd.to_numeric(
-        df["Wskaznik_CPI"], errors="coerce"
-    )
+    df["CPI"] = pd.to_numeric(df["Wskaznik_CPI"], errors="coerce")
     df["CPI_factor"] = df["CPI"] / 100.0
 
     df["Realna_Placa_Minimalna"] = (
         df["Placa_Minimalna"] / df["CPI_factor"]
     )
-
     df["Realne_Wynagrodzenie"] = (
-        df["Przecietne_Wynagrodzenie_Kraj"] /
-        df["CPI_factor"]
+        df["Przecietne_Wynagrodzenie_Kraj"] / df["CPI_factor"]
     )
+    # Realny PKB pochodzi bezpośrednio z tabeli GUS RACH 3502
+    # (PKB w cenach stałych), więc nie deflujemy go ponownie CPI.
 
-    df["Realny_PKB"] = (
-        df["PKB_Nominalny"] / df["CPI_factor"]
-    )
-
-    # Treatment: realny Wskaźnik Kaitza.
-    # Ponieważ obie płace defluujemy tym samym CPI, CPI algebraicznie
-    # skraca się w ilorazie, zachowując standardowy Kaitz.
     df["Kaitz_Index"] = (
         df["Realna_Placa_Minimalna"] /
         df["Realne_Wynagrodzenie"]
@@ -393,55 +699,59 @@ def load_and_clean_data(ryne_path, rach_path, ceny_path):
         .pct_change(fill_method=None) * 100
     )
 
-    df["Udzial_Przemyslu"] = np.where(
-        df["WDB_Ogolem"] != 0,
-        df["WDB_Przemysl"] / df["WDB_Ogolem"],
-        np.nan,
-    )
+    # Udział przemysłu z RYNE 4098 jest już procentem.
+    # Przeliczamy na udział 0-1 dla modelu.
+    if df["Udzial_Przemyslu"].dropna().abs().median() > 1.5:
+        df["Udzial_Przemyslu"] = df["Udzial_Przemyslu"] / 100.0
 
-    df["Produktywnosc"] = np.where(
-        df["Zatrudnieni_Ogolem"] != 0,
-        df["Realny_PKB"] / df["Zatrudnieni_Ogolem"],
-        np.nan,
-    )
-
-    # Jeżeli GUS podał nominalne PKB per capita, przeliczamy je
-    # samodzielnie na realną wielkość, aby zmienna była spójna.
-    if "Populacja" in df.columns:
-        calculated_real_pc = np.where(
-            df["Populacja"] != 0,
-            df["Realny_PKB"] / df["Populacja"],
+    # Jeżeli mamy liczbę pracujących, możemy policzyć produktywność.
+    # Gdy RACH jej nie zawiera, pozostawiamy NaN i usuwamy ją z X tylko później,
+    # zamiast tworzyć sztuczną wartość.
+    if "Zatrudnieni_Ogolem" in df.columns:
+        df["Produktywnosc"] = np.where(
+            pd.to_numeric(df["Zatrudnieni_Ogolem"], errors="coerce") != 0,
+            df["Realny_PKB"] /
+            pd.to_numeric(df["Zatrudnieni_Ogolem"], errors="coerce"),
             np.nan,
         )
-        df["Realny_PKB_per_capita"] = calculated_real_pc
+    else:
+        df["Produktywnosc"] = np.nan
+
+    if "Populacja" not in df.columns:
+        df["Populacja"] = np.nan
+
+    # Nie rekonstruujemy automatycznie PKB per capita z niezweryfikowanych
+    # jednostek ludności. Jeżeli RACH dostarcza tę zmienną, zachowujemy ją.
+    if "Realny_PKB_per_capita" not in df.columns:
+        df["Realny_PKB_per_capita"] = np.nan
 
     model_cols = [
-        "Wojewodztwo",
-        "Kod_Str",
-        "Rok",
-        "Kaitz_Index",
-        "Stopa_Zatrudnienia",
-        "Bezrobocie_Rejestrowane",
-        "Wzrost_PKB",
-        "Realny_PKB_per_capita",
-        "Udzial_Przemyslu",
-        "Produktywnosc",
-        "Populacja",
-        "CPI",
+        "Wojewodztwo", "Kod_Str", "Rok", "Kaitz_Index",
+        "Stopa_Zatrudnienia", "Bezrobocie_Rejestrowane",
+        "Wzrost_PKB", "Realny_PKB_per_capita",
+        "Udzial_Przemyslu", "Produktywnosc", "Populacja", "CPI",
     ]
 
-    df = coerce_numeric(
-        df,
-        [
-            c for c in model_cols
-            if c in df.columns
-            and c not in ["Wojewodztwo", "Kod_Str"]
-        ],
-    )
-
+    numeric_cols = [
+        c for c in model_cols
+        if c not in ["Wojewodztwo", "Kod_Str"]
+    ]
+    df = coerce_numeric(df, numeric_cols)
     df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=model_cols).copy()
-    df = df.drop_duplicates(["Kod_Str", "Rok"])
+
+    # Produktywność i PKB per capita mogą nie być dostępne w aktualnym
+    # eksporcie RACH. Nie blokujemy przez to całej aplikacji.
+    required_for_model = [
+        "Wojewodztwo", "Kod_Str", "Rok", "Kaitz_Index",
+        "Stopa_Zatrudnienia", "Bezrobocie_Rejestrowane",
+        "Wzrost_PKB", "Udzial_Przemyslu", "CPI",
+    ]
+    df = df.dropna(subset=required_for_model).copy()
+
+    # Uzupełnienie kontrolnych zmiennych, jeśli RACH ich nie podał.
+    if df["Realny_PKB_per_capita"].isna().all():
+        # Przy braku wiarygodnego PKB per capita nie używamy tej zmiennej w CF.
+        df["Realny_PKB_per_capita"] = np.nan
 
     return df.reset_index(drop=True)
 
@@ -493,7 +803,7 @@ def run_panel_benchmark(df):
 # 5. DML + CAUSAL FOREST
 # ============================================================
 
-X_COLS = [
+X_COLS_BASE = [
     "Bezrobocie_Rejestrowane",
     "Wzrost_PKB",
     "Realny_PKB_per_capita",
@@ -501,10 +811,19 @@ X_COLS = [
     "Produktywnosc",
 ]
 
-W_COLS = [
+W_COLS_BASE = [
     "Populacja",
     "CPI",
 ]
+
+X_COLS = X_COLS_BASE
+W_COLS = W_COLS_BASE
+
+
+def get_available_model_columns(df):
+    x_cols = [c for c in X_COLS_BASE if c in df.columns and not df[c].isna().all()]
+    w_cols = [c for c in W_COLS_BASE if c in df.columns and not df[c].isna().all()]
+    return x_cols, w_cols
 
 
 def build_xgb():
@@ -530,8 +849,26 @@ def run_models(df):
     Y = work["Stopa_Zatrudnienia"].to_numpy(dtype=float)
     T = work["Kaitz_Index"].to_numpy(dtype=float)
 
-    X = work[X_COLS].copy()
-    W = work[W_COLS].copy()
+    x_cols, w_cols = get_available_model_columns(work)
+
+    if len(x_cols) < 2:
+        raise ValueError(
+            "Za mało dostępnych zmiennych heterogeniczności dla Causal Forest. "
+            f"Dostępne: {x_cols}"
+        )
+
+    X = work[x_cols].copy()
+    W = work[w_cols].copy() if w_cols else None
+
+    model_frame = pd.concat([X, W] if W is not None else [X], axis=1)
+    valid = model_frame.notna().all(axis=1)
+
+    Y = Y[valid.to_numpy()]
+    T = T[valid.to_numpy()]
+    X = X.loc[valid].copy()
+    if W is not None:
+        W = W.loc[valid].copy()
+    work = work.loc[valid].copy()
 
     causal_forest = CausalForestDML(
         model_y=build_xgb(),
@@ -633,7 +970,7 @@ def make_shap_plot(res):
         return fig
 
     display_names = {
-        "Bezrobocie_Rejestrowane": "Bezrobocie rejestrowane",
+        "Bezrobocie_Rejestrowane": "Stopa bezrobocia (BAEL)",
         "Wzrost_PKB": "Wzrost PKB",
         "Realny_PKB_per_capita": "Realny PKB per capita",
         "Udzial_Przemyslu": "Udział przemysłu w WDB",
@@ -682,25 +1019,53 @@ local_files = get_local_data_files()
 
 # Dane są częścią repozytorium. Aplikacja nie wymaga żadnego
 # ręcznego wgrywania plików przez użytkownika.
-auto_ryne = detect_file("RYNE")
-auto_rach = detect_file("RACH")
+auto_ryne_sector = detect_file("RYNE_SECTOR")
+auto_ryne_unemployment = detect_file("RYNE_UNEMPLOYMENT")
+auto_ryne_employment = detect_file("RYNE_EMPLOYMENT")
+auto_rach_nominal = detect_file("RACH_GDP_NOMINAL")
+auto_rach_real = detect_file("RACH_GDP_REAL")
+auto_rach_real_pc = detect_file("RACH_GDP_REAL_PC")
 auto_ceny = detect_file("CENY")
 
-ryne_path = auto_ryne
-rach_path = auto_rach
+ryne_sector_path = auto_ryne_sector
+ryne_unemployment_path = auto_ryne_unemployment
+ryne_employment_path = auto_ryne_employment
+rach_nominal_path = auto_rach_nominal
+rach_real_path = auto_rach_real
+rach_real_pc_path = auto_rach_real_pc
 ceny_path = auto_ceny
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Automatycznie wykryte pliki")
 
 st.sidebar.write(
-    f"**RYNE:** "
-    f"{Path(ryne_path).name if ryne_path else 'brak'}"
+    f"**RYNE 4098 — sektor:** "
+    f"{Path(ryne_sector_path).name if ryne_sector_path else 'brak'}"
 )
 
 st.sidebar.write(
-    f"**RACH:** "
-    f"{Path(rach_path).name if rach_path else 'brak'}"
+    f"**RYNE 4100 — bezrobocie:** "
+    f"{Path(ryne_unemployment_path).name if ryne_unemployment_path else 'brak'}"
+)
+
+st.sidebar.write(
+    f"**RYNE 4112 — zatrudnienie:** "
+    f"{Path(ryne_employment_path).name if ryne_employment_path else 'brak'}"
+)
+
+st.sidebar.write(
+    f"**RACH 3498 — PKB nominalne:** "
+    f"{Path(rach_nominal_path).name if rach_nominal_path else 'brak'}"
+)
+
+st.sidebar.write(
+    f"**RACH 3502 — PKB realne:** "
+    f"{Path(rach_real_path).name if rach_real_path else 'brak'}"
+)
+
+st.sidebar.write(
+    f"**RACH 3503 — PKB realne per capita:** "
+    f"{Path(rach_real_pc_path).name if rach_real_pc_path else 'brak'}"
 )
 
 st.sidebar.write(
@@ -708,7 +1073,15 @@ st.sidebar.write(
     f"{Path(ceny_path).name if ceny_path else 'brak'}"
 )
 
-if all([ryne_path, rach_path, ceny_path]):
+if all([
+    ryne_sector_path,
+    ryne_unemployment_path,
+    ryne_employment_path,
+    rach_nominal_path,
+    rach_real_path,
+    rach_real_pc_path,
+    ceny_path,
+]):
     st.sidebar.success("Dane z repozytorium są gotowe.")
 else:
     st.sidebar.error("Nie znaleziono kompletu danych w repozytorium.")
@@ -722,7 +1095,15 @@ run_analysis = st.sidebar.button(
 if run_analysis:
 
     if not all(
-        [ryne_path, rach_path, ceny_path]
+        [
+            ryne_sector_path,
+            ryne_unemployment_path,
+            ryne_employment_path,
+            rach_nominal_path,
+            rach_real_path,
+            rach_real_pc_path,
+            ceny_path,
+        ]
     ):
         st.error(
             "Brakuje co najmniej jednego źródła danych. "
@@ -735,8 +1116,12 @@ if run_analysis:
     ):
         try:
             df = load_and_clean_data(
-                ryne_path,
-                rach_path,
+                ryne_sector_path,
+                ryne_unemployment_path,
+                ryne_employment_path,
+                rach_nominal_path,
+                rach_real_path,
+                rach_real_pc_path,
                 ceny_path,
             )
 
@@ -1066,7 +1451,7 @@ if run_analysis:
             )
 
             ax.set_xlabel(
-                "Stopa bezrobocia rejestrowanego"
+                "Stopa bezrobocia (BAEL)"
             )
 
             ax.set_ylabel(
@@ -1164,7 +1549,7 @@ if run_analysis:
 
             importance = pd.DataFrame(
                 {
-                    "Zmienna": X_COLS,
+                    "Zmienna": res["X_data"].columns,
                     "Średnia |SHAP|": np.mean(
                         np.abs(shap_values),
                         axis=0,
@@ -1177,7 +1562,7 @@ if run_analysis:
 
             name_map = {
                 "Bezrobocie_Rejestrowane":
-                    "Bezrobocie rejestrowane",
+                    "Stopa bezrobocia (BAEL)",
                 "Wzrost_PKB":
                     "Wzrost PKB",
                 "Realny_PKB_per_capita":
@@ -1202,8 +1587,8 @@ if run_analysis:
 else:
 
     st.info(
-        "Wybierz pliki RYNE, RACH i CENY lub umieść je w folderze "
-        "aplikacji, a następnie kliknij **Uruchom pełną analizę**."
+        "Dane RYNE, RACH i CENY są automatycznie pobierane z repozytorium. "
+        "Kliknij **Uruchom pełną analizę**."
     )
 
 st.sidebar.markdown("---")
