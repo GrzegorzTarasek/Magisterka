@@ -181,32 +181,41 @@ def read_table(path):
     raise ValueError(f"Nieobsługiwany format pliku: {path}")
 
 
-def detect_file(uploaded_files, prefix):
-    matches = [
-        f for f in uploaded_files
-        if Path(f).name.upper().startswith(prefix.upper())
-    ]
+REPOSITORY_FILES = {
+    "RYNE": "RYNE_4098_CTAB_20261006234440.csv",
+    "RACH": "RACH_3510_XTAB_20261007010935.xlsx",
+    "CENY": "CENY_2496_XTAB_20261007223438.xlsx",
+}
 
-    if not matches:
-        return None
+def detect_file(prefix):
+    prefix = prefix.upper()
+    exact_name = REPOSITORY_FILES.get(prefix)
 
-    preferred = []
-    if prefix.upper() == "RYNE":
-        preferred = [f for f in matches if "4098" in Path(f).name]
-    elif prefix.upper() == "RACH":
-        preferred = [f for f in matches if "3510" in Path(f).name]
-    elif prefix.upper() == "CENY":
-        preferred = [f for f in matches if "2496" in Path(f).name]
+    if exact_name:
+        exact_path = APP_DIR / exact_name
+        if exact_path.exists():
+            return str(exact_path)
 
-    return sorted(preferred or matches)[-1]
+    # Fallback: if the exact repository filename changes in a later commit,
+    # find another file with the same GUS dataset prefix.
+    matches = sorted(
+        p for p in APP_DIR.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}
+        and p.name.upper().startswith(prefix)
+    )
 
+    return str(matches[-1]) if matches else None
+
+
+APP_DIR = Path(__file__).resolve().parent
 
 def get_local_data_files():
     extensions = {".csv", ".xlsx", ".xls", ".xlsm"}
     return [
-        str(Path(p))
-        for p in glob.glob("*")
-        if Path(p).suffix.lower() in extensions
+        str(p)
+        for p in APP_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in extensions
     ]
 
 
@@ -671,71 +680,15 @@ st.sidebar.header("Panel sterowania")
 
 local_files = get_local_data_files()
 
-uploaded_ryne = st.sidebar.file_uploader(
-    "RYNE — rynek pracy",
-    type=["csv", "xlsx", "xls"],
-    key="ryne_upload",
-)
+# Dane są częścią repozytorium. Aplikacja nie wymaga żadnego
+# ręcznego wgrywania plików przez użytkownika.
+auto_ryne = detect_file("RYNE")
+auto_rach = detect_file("RACH")
+auto_ceny = detect_file("CENY")
 
-uploaded_rach = st.sidebar.file_uploader(
-    "RACH — rachunki regionalne",
-    type=["csv", "xlsx", "xls"],
-    key="rach_upload",
-)
-
-uploaded_ceny = st.sidebar.file_uploader(
-    "CENY — CPI",
-    type=["csv", "xlsx", "xls"],
-    key="ceny_upload",
-)
-
-
-def save_uploaded_temp(uploaded_file, prefix):
-    if uploaded_file is None:
-        return None
-
-    temp_dir = Path(".streamlit_uploads")
-    temp_dir.mkdir(exist_ok=True)
-
-    target = temp_dir / f"{prefix}_{uploaded_file.name}"
-    target.write_bytes(uploaded_file.getbuffer())
-
-    return str(target)
-
-
-ryne_upload_path = save_uploaded_temp(
-    uploaded_ryne,
-    "RYNE",
-)
-
-rach_upload_path = save_uploaded_temp(
-    uploaded_rach,
-    "RACH",
-)
-
-ceny_upload_path = save_uploaded_temp(
-    uploaded_ceny,
-    "CENY",
-)
-
-auto_ryne = detect_file(
-    local_files,
-    "RYNE",
-)
-
-auto_rach = detect_file(
-    local_files,
-    "RACH",
-)
-
-auto_ceny = detect_file(
-    local_files,
-    "CENY",
-)
-
-ryne_path = ryne_upload_path or auto_ryne
-rach_path = rach_upload_path or auto_rach
-ceny_path = ceny_upload_path or auto_ceny
+ryne_path = auto_ryne
+rach_path = auto_rach
+ceny_path = auto_ceny
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Automatycznie wykryte pliki")
@@ -754,6 +707,11 @@ st.sidebar.write(
     f"**CENY:** "
     f"{Path(ceny_path).name if ceny_path else 'brak'}"
 )
+
+if all([ryne_path, rach_path, ceny_path]):
+    st.sidebar.success("Dane z repozytorium są gotowe.")
+else:
+    st.sidebar.error("Nie znaleziono kompletu danych w repozytorium.")
 
 run_analysis = st.sidebar.button(
     "🚀 Uruchom pełną analizę",
