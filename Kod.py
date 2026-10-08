@@ -97,6 +97,7 @@ WOJEWODZTWA_MAP = {
     '30': 'Wielkopolskie', '32': 'Zachodniopomorskie'
 }
 
+CODE_VERSION = "2026-10-08-v3"       # zmień przy każdej zmianie kodu: unieważnia cache Streamlita (cache_data nie widzi zmian w funkcjach wywoływanych)
 YEAR_MIN = min(MIN_WAGE_PL)          # 2010 – pierwszy rok z danymi o płacy minimalnej
 YEAR_MAX = 2025
 PRESAMPLE = (2005, 2009)             # okres sprzed próby – do wyznaczenia wynagrodzenia bazowego (ekspozycji)
@@ -875,7 +876,12 @@ def prepare_causal_sample(df: pd.DataFrame, treat: str, xcols: list, wcols: list
                           y: str = "Stopa_Zatrudnienia") -> pd.DataFrame:
     """Próba kompletna; Y, T i kontrole W oczyszczone z efektów stałych województw i lat (przekształcenie
     within), dzięki czemu Causal Forest uczy się z wariancji 'różnicy w różnicach', a nie z poziomów."""
-    d = df.dropna(subset=[y, treat] + xcols + wcols).reset_index(drop=True)
+    need = [y, treat] + xcols + wcols
+    absent = [c for c in need if c not in df.columns]
+    if absent:
+        raise DataError(f"W panelu brakuje kolumn: {absent}. Prawdopodobnie to zapamiętany (nieaktualny) panel – "
+                        "wyczyść pamięć podręczną (przycisk w panelu bocznym) i uruchom analizę ponownie.")
+    d = df.dropna(subset=need).reset_index(drop=True)
     V = d[[y, treat] + wcols].to_numpy(float)
     if fe_demean:
         M = np.column_stack([pd.get_dummies(d["Kod_Str"], dtype=float).to_numpy(),
@@ -1085,7 +1091,7 @@ def _fmt_models(models: dict, keep: list) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def compute_linear(panel: pd.DataFrame, lag: bool, treat: str, B: int, seed: int) -> dict:
+def compute_linear(panel: pd.DataFrame, lag: bool, treat: str, B: int, seed: int, version: str = "") -> dict:
     suf = "_L1" if lag else ""
     ctrl = [c + suf for c in KEYNES_COLS]
     y = "Stopa_Zatrudnienia"
@@ -1181,8 +1187,21 @@ def collect_sources(uploaded):
 
 
 @st.cache_data(show_spinner=False)
-def load_panel(sources: dict):
+def load_panel(sources: dict, version: str = ""):
     return build_panel(sources)
+
+
+REQUIRED_PANEL_COLS = ["Kaitz_pp", "Kaitz_Ekspozycja_pp", "Kaitz_Sr_woj", "Stopa_Zatrudnienia", "Bezrobocie_BAEL",
+                       "Wzrost_PKB", "Udzial_Przemyslu", "Bezrobocie_BAEL_L1", "Wzrost_PKB_L1", "Udzial_Przemyslu_L1"]
+
+
+def get_panel(sources: dict):
+    """Panel z cache; jeśli zapamiętany panel jest nieaktualny (brak kolumn) – czyści cache i buduje od nowa."""
+    panel, diag = load_panel(sources, CODE_VERSION)
+    if any(c not in panel.columns for c in REQUIRED_PANEL_COLS):
+        st.cache_data.clear()
+        panel, diag = build_panel(sources)
+    return panel, diag
 
 
 def variation_table(panel: pd.DataFrame, cols: list) -> pd.DataFrame:
@@ -1967,12 +1986,16 @@ def main():
         seed = st.number_input("Ziarno losowe", 0, 9999, 42)
         native = st.checkbox("Spróbuj także natywnych SHAP z EconML", value=False)
     treat = "Kaitz_pp" if treat_lab.startswith("Kaitz rzeczywisty") else "Kaitz_Ekspozycja_pp"
-    cfg = {"treat": treat, "lag": bool(lag), "fe_demean": bool(fe_demean), "bite": bool(bite), "n_trees": int(n_trees),
+    if st.sidebar.button("Wyczyść pamięć podręczną"):
+        st.cache_data.clear()
+        for k in ("lin", "cres", "cres_err", "cfg", "cf_seeds", "cf_placebo"):
+            st.session_state.pop(k, None)
+    cfg = {"v": CODE_VERSION, "treat": treat, "lag": bool(lag), "fe_demean": bool(fe_demean), "bite": bool(bite), "n_trees": int(n_trees),
            "min_leaf": int(min_leaf), "seed": int(seed), "native_shap": bool(native)}
     run_analysis = st.sidebar.button("Uruchom Pełną Analizę")
 
     try:
-        panel, diag = load_panel(sources)
+        panel, diag = get_panel(sources)
     except DataError as e:
         st.error(f"Nie udało się zbudować panelu: {e}")
         st.info("Wgraj brakujące pliki w panelu bocznym (Drag & Drop) lub umieść je w folderze z aplikacją.")
@@ -1990,7 +2013,7 @@ def main():
 
     if run_analysis:
         with st.spinner("Przetwarzanie danych i trenowanie modeli (OLS/TWFE → Causal Forest → SHAP)…"):
-            st.session_state["lin"] = compute_linear(panel, cfg["lag"], treat, int(B), cfg["seed"])
+            st.session_state["lin"] = compute_linear(panel, cfg["lag"], treat, int(B), cfg["seed"], CODE_VERSION)
             st.session_state["cres"], st.session_state["cres_err"] = None, None
             try:
                 st.session_state["cres"] = compute_causal(panel, cfg)
