@@ -137,6 +137,7 @@ MOD_LABELS = {
     "Udzial_Przemyslu": "Udział przemysłu w WDB (struktura)",
     "Realny_PKB_per_capita": "Realny PKB per capita (zł, ceny 2010)",
     "Produktywnosc": "Produktywność (realna WDB / pracującego, zł)",
+    "Kaitz_Sr_woj": "Przeciętny Kaitz w województwie 2010–24 (p.p.; 'siła oddziaływania')",
 }
 
 
@@ -552,6 +553,8 @@ def build_panel(sources: dict):
     if df.empty:
         raise DataError("Panel jest pusty po połączeniu plików – sprawdź zgodność lat i kodów jednostek.")
 
+    df["Kaitz_Sr_woj"] = df.groupby("Kod_Str")["Kaitz_pp"].transform("mean")   # stały w czasie modyfikator
+
     # --- kontrole poprawności -----------------------------------------------------------
     if wage_pl_gus is not None:
         chk = pd.DataFrame({"GUS_WYNA_2797_Polska": wage_pl_gus,
@@ -847,7 +850,8 @@ def label_of(col: str) -> str:
 def short_label(col: str) -> str:
     base = col[:-3] if col.endswith("_L1") else col
     return {"Bezrobocie_BAEL": "Bezrobocie", "Wzrost_PKB": "Wzrost PKB", "Udzial_Przemyslu": "Udział przemysłu",
-            "Realny_PKB_per_capita": "PKB per capita", "Produktywnosc": "Produktywność"}.get(base, base) + \
+            "Realny_PKB_per_capita": "PKB per capita", "Produktywnosc": "Produktywność",
+            "Kaitz_Sr_woj": "Przeciętny Kaitz woj."}.get(base, base) + \
         (" (t-1)" if col.endswith("_L1") else "")
 
 
@@ -860,9 +864,9 @@ def make_gbm(seed: int, n_estimators: int = 150):
     return HistGradientBoostingRegressor(max_depth=3, learning_rate=0.05, max_iter=n_estimators, random_state=seed)
 
 
-def causal_columns(lag: bool):
+def causal_columns(lag: bool, bite: bool = False):
     suf = "_L1" if lag else ""
-    xcols = [c + suf for c in MOD_COLS]
+    xcols = [c + suf for c in MOD_COLS] + (["Kaitz_Sr_woj"] if bite else [])
     wcols = ["ln_Populacja", "CPI_Region" + suf]
     return xcols, wcols
 
@@ -948,7 +952,7 @@ def fit_causal_forest(d: pd.DataFrame, xcols: list, wcols: list, seed: int = 42,
         except Exception as e:
             notes.append(f"Natywne SHAP z EconML niedostępne ({type(e).__name__}).")
     return {"tau": tau, "lo": lo, "hi": hi, "ate": float(np.mean(tau)), "ate_lo": a_lo, "ate_hi": a_hi,
-            "importances": fi, "native_shap": native, "notes": notes}
+            "importances": fi, "native_shap": native, "notes": notes, "model": cf}
 
 
 def shap_surrogate(X_df: pd.DataFrame, tau: np.ndarray, seed: int):
@@ -961,7 +965,11 @@ def shap_surrogate(X_df: pd.DataFrame, tau: np.ndarray, seed: int):
     explainer = shap.TreeExplainer(sur)
     sv = np.asarray(explainer.shap_values(X_df))
     base = float(np.ravel(explainer.expected_value)[0])
-    return sv, base, fid
+    try:
+        inter = np.asarray(explainer.shap_interaction_values(X_df))
+    except Exception:
+        inter = None
+    return sv, base, fid, inter
 
 
 def cluster_boot_ci(vals, gids, B: int = 400, seed: int = 0):
@@ -1020,7 +1028,7 @@ def placebo_causal_forest(d: pd.DataFrame, xcols: list, wcols: list, B: int, see
 
 def run_causal_analysis(df: pd.DataFrame, cfg: dict) -> dict:
     """Pełna ścieżka Causal ML. cfg: treat, lag, fe_demean, n_trees, seed, min_leaf, native_shap."""
-    xcols, wcols = causal_columns(cfg["lag"])
+    xcols, wcols = causal_columns(cfg["lag"], cfg.get("bite", False))
     d = prepare_causal_sample(df, cfg["treat"], xcols, wcols, cfg["fe_demean"])
     if len(d) < 60:
         raise DataError(f"Za mało kompletnych obserwacji do Causal Forest (N = {len(d)}).")
@@ -1035,11 +1043,16 @@ def run_causal_analysis(df: pd.DataFrame, cfg: dict) -> dict:
         out["ate_lo"], out["ate_hi"] = cluster_boot_ci(cf["tau"], d["Kod_Str"], seed=1)
         out["notes"].append("Przedział ATE: bootstrap klastrów po województwach (średnia z CATE; "
                             "pomija niepewność estymacji lasu).")
+    try:
+        out["surfaces"] = cate_surfaces(cf["model"], d, xcols)
+    except Exception as e:
+        out["surfaces"] = None
+        out["notes"].append(f"Powierzchnie CATE niedostępne: {type(e).__name__}: {str(e)[:100]}")
     out["groups"] = {c: group_cate_table(d, cf["tau"], c) for c in [k for k in xcols if k.split("_L1")[0] in KEYNES_COLS]}
     out["projection"] = cate_projection(d, cf["tau"], xcols)
     try:
-        sv, base, fid = shap_surrogate(d[xcols], cf["tau"], cfg["seed"])
-        out["shap"] = {"values": sv, "base": base, "fidelity": fid}
+        sv, base, fid, inter = shap_surrogate(d[xcols], cf["tau"], cfg["seed"])
+        out["shap"] = {"values": sv, "base": base, "fidelity": fid, "interaction": inter}
     except Exception as e:
         out["shap"] = None
         out["notes"].append(f"SHAP niedostępne: {type(e).__name__}: {str(e)[:120]}")
@@ -1087,6 +1100,9 @@ def compute_linear(panel: pd.DataFrame, lag: bool, treat: str, B: int, seed: int
     ires, ints, (F, pF, q) = interaction_model(panel, y, treat, ctrl, [])
     out["interactions"] = {"tidy": ires.tidy(keep=[treat] + ints), "F": F, "p": pF, "q": q, "n": ires.n}
     out["event"], out["event_pre"] = event_study(panel)
+    out["dose"] = dose_response_bins(panel, ctrl, treat, y)
+    out["quad"] = quadratic_twfe(panel, ctrl, treat, y)
+    out["thr"] = threshold_scan(panel, ctrl, treat, y, B=min(B, 999), seed=seed)
     out["robust"], _ = robustness_linear(panel, ctrl, B=min(B, 499), seed=seed)
     out["loo"] = leave_one_region_out(panel, y, ["Kaitz_pp"] + ctrl)
     d_fe = prepare_causal_sample(panel, treat, [], [], True)
@@ -1110,7 +1126,7 @@ def compute_causal(panel: pd.DataFrame, cfg: dict) -> dict:
 
 @st.cache_data(show_spinner=False)
 def compute_cf_robustness(panel: pd.DataFrame, cfg: dict, kind: str, B: int) -> dict:
-    xcols, wcols = causal_columns(cfg["lag"])
+    xcols, wcols = causal_columns(cfg["lag"], cfg.get("bite", False))
     d = prepare_causal_sample(panel, cfg["treat"], xcols, wcols, cfg["fe_demean"])
     if kind == "seeds":
         rows, ref = [], None
@@ -1425,6 +1441,7 @@ def render_shap(cres):
         st.markdown("**Ważność cech w lesie przyczynowym (udział w podziałach)**")
         fi = pd.Series(cres["importances"], index=[short_label(c) for c in cres["xcols"]]).sort_values(ascending=False)
         st.dataframe(fi.rename("ważność").round(3), use_container_width=True)
+    render_shap_extras(cres, sh, X_df, sv)
     if cres.get("native_shap") is not None:
         st.markdown("**Natywne SHAP z EconML**")
         try:
@@ -1497,6 +1514,436 @@ def render_export(panel, lin, cres):
             f"klastrów = {m['p_wild']:.3f}; N = {m['n']}, {m['G']} województw).", language="text")
 
 
+
+
+# =============================================================================
+# 10. NIELINIOWOŚĆ: krzywa dawka–odpowiedź, test progu, powierzchnie CATE, kartogram
+# =============================================================================
+def dose_response_bins(df, ctrl, treat="Kaitz_pp", y="Stopa_Zatrudnienia", nb=5) -> pd.DataFrame:
+    """TWFE z dummies kwantyli Kaitza (kategoria bazowa = najniższy kwantyl). Nieparametryczna krzywa
+    dawka–odpowiedź w ramach benchmarku liniowego z efektami stałymi."""
+    d = df.dropna(subset=[y, treat] + ctrl).copy()
+    d["_bin"] = pd.qcut(d[treat], nb, labels=False, duplicates="drop")
+    nbe = int(d["_bin"].max()) + 1
+    xs = []
+    for k in range(1, nbe):
+        d[f"bin{k}"] = (d["_bin"] == k).astype(float)
+        xs.append(f"bin{k}")
+    res = fit_linear(d, y, xs + ctrl, fe="twfe")
+    rows = []
+    for k in range(nbe):
+        g = d[d["_bin"] == k][treat]
+        row = {"kwantyl": k + 1, "zakres Kaitza (p.p.)": f"{g.min():.1f}–{g.max():.1f}", "średni Kaitz": g.mean(),
+               "N": len(g), "efekt vs kwantyl 1": 0.0, "CI95 dół": 0.0, "CI95 góra": 0.0, "p-value": np.nan}
+        if k > 0:
+            i = res.names.index(f"bin{k}")
+            row.update({"efekt vs kwantyl 1": res.beta[i], "CI95 dół": res.lo[i], "CI95 góra": res.hi[i],
+                        "p-value": res.p[i]})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def quadratic_twfe(df, ctrl, treat="Kaitz_pp", y="Stopa_Zatrudnienia") -> dict:
+    """TWFE z członem kwadratowym; krzywa efektu względem średniego Kaitza z przedziałem (delta method)."""
+    d = df.dropna(subset=[y, treat] + ctrl).copy()
+    m = d[treat].mean()
+    d["k1"] = d[treat] - m
+    d["k2"] = d["k1"] ** 2 / 10.0
+    res = fit_linear(d, y, ["k1", "k2"] + ctrl, fe="twfe")
+    i1, i2 = res.names.index("k1"), res.names.index("k2")
+    grid = np.linspace(d[treat].quantile(0.02), d[treat].quantile(0.98), 60)
+    k1 = grid - m
+    g = np.column_stack([k1, k1 ** 2 / 10.0])
+    V = res.V[np.ix_([i1, i2], [i1, i2])]
+    fit = g @ res.beta[[i1, i2]]
+    se = np.sqrt(np.einsum("ij,jk,ik->i", g, V, g))
+    crit = stats.t.ppf(0.975, res.G - 1)
+    b2 = res.beta[i2] / 10.0
+    turning = float(m - res.beta[i1] / (2 * b2)) if abs(b2) > 1e-12 else np.nan
+    inside = bool(np.isfinite(turning) and grid.min() <= turning <= grid.max())
+    return {"curve": pd.DataFrame({"Kaitz": grid, "fit": fit, "lo": fit - crit * se, "hi": fit + crit * se}),
+            "p_quad": float(res.p[i2]), "turning": turning, "inside": inside, "mean": float(m),
+            "b1": float(res.beta[i1]), "b2": float(b2)}
+
+
+def threshold_scan(df, ctrl, treat="Kaitz_pp", y="Stopa_Zatrudnienia", n_knots=25, B=299, seed=42) -> dict:
+    """Model odcinkowo-liniowy z jednym załamaniem: y ~ x + max(x-k, 0) + kontrole + FE (woj., lata).
+    Skan po węzłach k; statystyka sup-F i wartość p z dzikiego bootstrapu klastrów H0: model liniowy
+    (zwykła wartość p w najlepszym węźle byłaby zawyżona, bo węzeł wybrano po danych)."""
+    d = df.dropna(subset=[y, treat] + ctrl).reset_index(drop=True)
+    x = d[treat].to_numpy(float)
+    knots = np.quantile(x, np.linspace(0.15, 0.85, n_knots))
+    ent = d["Kod_Str"].to_numpy()
+
+    def within(M):
+        M = pd.DataFrame(M)
+        return (M - M.groupby(ent).transform("mean")).to_numpy()
+
+    Dy = pd.get_dummies(d["Rok"], drop_first=True, dtype=float).to_numpy()
+    W = within(np.column_stack([x, d[ctrl].to_numpy(float), Dy]))
+    Zk = within(np.column_stack([np.maximum(x - k, 0.0) for k in knots]))
+    yy = within(d[[y]].to_numpy(float))[:, 0]
+    Pinv = np.linalg.pinv(W.T @ W)
+
+    def resid(M):
+        return M - W @ (Pinv @ (W.T @ M))
+
+    yr0, Zr = resid(yy), resid(Zk)
+    zz = (Zr ** 2).sum(axis=0)
+    n, p = len(d), W.shape[1] + d["Kod_Str"].nunique() + 1
+    dof = max(n - p, 1)
+
+    def fstats(yr):
+        red = (Zr.T @ yr) ** 2 / np.maximum(zz, 1e-12)
+        ssr = (yr ** 2).sum(axis=0) - red
+        return red / (ssr / dof)
+
+    F = fstats(yr0)
+    delta = (Zr.T @ yr0) / np.maximum(zz, 1e-12)
+    best = int(np.argmax(F))
+    gid = pd.factorize(d["Kod_Str"])[0]
+    G = gid.max() + 1
+    rng = np.random.default_rng(seed)
+    fit_r = yy - yr0
+    sup_b = np.empty(B)
+    for b in range(B):
+        w = rng.choice([-1.0, 1.0], size=G)[gid]
+        ys = fit_r + w * yr0
+        sup_b[b] = fstats(resid(ys)).max()
+    p_boot = float((np.sum(sup_b >= F.max()) + 1) / (B + 1))
+    d["_hinge"] = np.maximum(x - knots[best], 0.0)
+    r = fit_linear(d, y, [treat, "_hinge"] + ctrl, fe="twfe")
+    b_lo = float(r.beta[0])
+    b_hi = float(r.beta[0] + r.beta[1])
+    grid = np.linspace(np.quantile(x, 0.02), np.quantile(x, 0.98), 80)
+    fit_curve = b_lo * (grid - knots[best]) + r.beta[1] * np.maximum(grid - knots[best], 0.0)
+    return {"table": pd.DataFrame({"węzeł (p.p. Kaitza)": knots, "F": F, "zmiana nachylenia": delta}),
+            "best_knot": float(knots[best]), "supF": float(F.max()), "p_boot": p_boot, "slope_below": b_lo,
+            "slope_above": b_hi, "p_delta_naive": float(r.p[1]), "curve": pd.DataFrame({"Kaitz": grid, "fit": fit_curve}),
+            "B": B}
+
+
+def cate_surfaces(model, d: pd.DataFrame, xcols: list, n: int = 28, n_ice: int = 50, seed: int = 0) -> dict:
+    """Powierzchnie CATE z wytrenowanego lasu: (a) mapy 2D dla par moderatorów przy pozostałych na medianie,
+    (b) profile częściowej zależności (PDP) i krzywe ICE dla każdego moderatora."""
+    X = d[xcols].to_numpy(float)
+    med = np.median(X, axis=0)
+    keyn = [c for c in xcols if c.split("_L1")[0] in KEYNES_COLS]
+
+    def rng_of(j, k, lo=5, hi=95):
+        return np.linspace(np.percentile(X[:, j], lo), np.percentile(X[:, j], hi), k)
+
+    pairs = [(keyn[a], keyn[b]) for a in range(len(keyn)) for b in range(a + 1, len(keyn))]
+    if "Kaitz_Sr_woj" in xcols:
+        pairs += [("Kaitz_Sr_woj", k) for k in keyn]
+    out = {"pairs": {}, "pdp": {}}
+    for ca, cb in pairs:
+        ja, jb = xcols.index(ca), xcols.index(cb)
+        ga, gb = rng_of(ja, n), rng_of(jb, n)
+        A, Bm = np.meshgrid(ga, gb)
+        Gm = np.tile(med, (A.size, 1))
+        Gm[:, ja], Gm[:, jb] = A.ravel(), Bm.ravel()
+        Z = np.asarray(model.effect(Gm)).reshape(-1).reshape(A.shape)
+        out["pairs"][(ca, cb)] = (ga, gb, Z)
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(X), size=min(n_ice, len(X)), replace=False)
+    for j, c in enumerate(xcols):
+        g = rng_of(j, 40, 2, 98)
+        Gi = np.repeat(X[idx], len(g), axis=0)
+        Gi[:, j] = np.tile(g, len(idx))
+        ice = np.asarray(model.effect(Gi)).reshape(len(idx), len(g))
+        Gf = np.repeat(X, len(g), axis=0)
+        Gf[:, j] = np.tile(g, len(X))
+        pdp = np.asarray(model.effect(Gf)).reshape(len(X), len(g)).mean(axis=0)
+        out["pdp"][c] = (g, ice, pdp)
+    return out
+
+
+# ------------------------------- wykresy -------------------------------------
+TILE_POS = {  # kartogram kafelkowy Polski (kolumna, wiersz) – przybliżone położenie geograficzne
+    "32": (0, 0), "22": (1, 0), "28": (3, 0),
+    "08": (0, 1), "30": (1, 1), "04": (2, 1), "14": (3, 1), "20": (4, 1),
+    "02": (0, 2), "16": (1, 2), "10": (2, 2), "26": (3, 2), "06": (4, 2),
+    "24": (2, 3), "12": (3, 3), "18": (4, 3),
+}
+TILE_ABBR = {"02": "DŚ", "04": "KP", "06": "LU", "08": "LB", "10": "ŁD", "12": "MP", "14": "MZ", "16": "OP",
+             "18": "PK", "20": "PD", "22": "PM", "24": "ŚL", "26": "ŚW", "28": "WM", "30": "WP", "32": "ZP"}
+
+
+def plot_tile_map(ax, values: dict, title: str, cmap="RdBu", symmetric=True, fmt="{:.2f}", vlim=None):
+    """Kartogram kafelkowy 16 województw; values: {kod_woj: wartość}."""
+    v = np.array([x for x in values.values() if np.isfinite(x)], dtype=float)
+    if vlim is not None:
+        lo, hi = vlim
+    elif symmetric:
+        m = max(abs(v).max(), 1e-9)
+        lo, hi = -m, m
+    else:
+        lo, hi = v.min(), v.max()
+    norm_ = plt.Normalize(lo, hi)
+    cm = plt.get_cmap(cmap)
+    for code, (cx, cy) in TILE_POS.items():
+        val = values.get(code, np.nan)
+        color = cm(norm_(val)) if np.isfinite(val) else (0.9, 0.9, 0.9, 1)
+        ax.add_patch(plt.Rectangle((cx, -cy), 0.94, 0.94, facecolor=color, edgecolor="white", lw=2))
+        lum = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+        tc = "black" if lum > 0.55 else "white"
+        ax.text(cx + 0.47, -cy + 0.62, TILE_ABBR[code], ha="center", va="center", fontsize=11, weight="bold", color=tc)
+        if np.isfinite(val):
+            ax.text(cx + 0.47, -cy + 0.28, fmt.format(val), ha="center", va="center", fontsize=9, color=tc)
+    ax.set_xlim(-0.1, 5)
+    ax.set_ylim(-3.1, 1.0)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(title, fontsize=11)
+    sm_ = plt.cm.ScalarMappable(norm=norm_, cmap=cm)
+    sm_.set_array([])
+    ax.figure.colorbar(sm_, ax=ax, fraction=0.04, pad=0.02)
+
+
+def plot_surface(ax, ga, gb, Z, xl, yl, title, dx=None, dy=None):
+    lim = max(abs(np.nanmin(Z)), abs(np.nanmax(Z)), 1e-9)
+    cs = ax.contourf(ga, gb, Z, levels=np.linspace(-lim, lim, 21), cmap="RdBu", extend="both")
+    if np.nanmin(Z) < 0 < np.nanmax(Z):
+        ax.contour(ga, gb, Z, levels=[0], colors="black", linewidths=1.5, linestyles="--")
+    if dx is not None:
+        ax.scatter(dx, dy, s=7, color="black", alpha=0.35, linewidths=0)
+    ax.set_xlabel(xl)
+    ax.set_ylabel(yl)
+    ax.set_title(title, fontsize=10)
+    ax.figure.colorbar(cs, ax=ax, label="CATE (p.p.)")
+
+
+def plot_pdp_ice(ax, g, ice, pdp, xlabel, data_x):
+    for row in ice:
+        ax.plot(g, row, color="tab:blue", alpha=0.12, lw=1)
+    ax.plot(g, pdp, color="tab:red", lw=2.5, label="średnia (PDP)")
+    ax.axhline(0, color="black", lw=0.8, ls="--")
+    ax2 = ax.twinx()
+    ax2.hist(data_x, bins=20, color="grey", alpha=0.18)
+    ax2.set_yticks([])
+    ax.set_zorder(ax2.get_zorder() + 1)      # krzywe nad histogramem
+    ax.patch.set_visible(False)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("CATE (p.p.)")
+    ax.legend(fontsize=8, loc="best")
+
+
+def tercile_labels(s: pd.Series):
+    return pd.qcut(s, 3, labels=["niski", "średni", "wysoki"], duplicates="drop")
+
+
+def keynes_cross(d: pd.DataFrame, xcols: list):
+    """Tabela krzyżowa 3×3: faza cyklu (wzrost PKB) × rezerwy rynku pracy (bezrobocie): średni CATE i liczebność."""
+    cyc = next(c for c in xcols if c.startswith("Wzrost_PKB"))
+    res_ = next(c for c in xcols if c.startswith("Bezrobocie_BAEL"))
+    t = pd.DataFrame({"cykl": tercile_labels(d[cyc]), "rezerwy": tercile_labels(d[res_]), "tau": d["tau"], "g": d["Kod_Str"]})
+    mean = t.pivot_table(index="cykl", columns="rezerwy", values="tau", aggfunc="mean", observed=False)
+    cnt = t.pivot_table(index="cykl", columns="rezerwy", values="tau", aggfunc="size", observed=False)
+    return mean, cnt, cyc, res_
+
+
+def cate_region_year(d: pd.DataFrame) -> pd.DataFrame:
+    hm = d.pivot_table(index="Wojewodztwo", columns="Rok", values="tau", aggfunc="mean")
+    return hm.loc[hm.mean(axis=1).sort_values().index]
+
+
+def shap_region_feature(sv: np.ndarray, d: pd.DataFrame, names: list) -> pd.DataFrame:
+    t = pd.DataFrame(sv, columns=names)
+    t["Wojewodztwo"] = d["Wojewodztwo"].to_numpy()
+    return t.groupby("Wojewodztwo")[names].mean()
+
+
+def render_nonlinear(lin, cres, panel):
+    st.subheader("Nieliniowość i mapy zależności")
+    st.caption("CATE = zmiana stopy zatrudnienia (p.p.) przy wzroście wskaźnika Kaitza o 1 p.p. "
+               "Wartości ujemne = efekt niszczący zatrudnienie. Wszystkie krzywe pokazują to, co mówią dane – "
+               "także wtedy, gdy przedziały ufności obejmują zero.")
+    if lin is None:
+        st.info("Naciśnij 'Uruchom Pełną Analizę' w panelu bocznym.")
+        return
+    st.markdown("### 1. Krzywa dawka–odpowiedź w modelu z efektami stałymi (benchmark liniowy)")
+    dose, quad, thr = lin["dose"], lin["quad"], lin["thr"]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.errorbar(dose["średni Kaitz"], dose["efekt vs kwantyl 1"],
+                    yerr=[dose["efekt vs kwantyl 1"] - dose["CI95 dół"], dose["CI95 góra"] - dose["efekt vs kwantyl 1"]],
+                    fmt="o-", capsize=4, color="tab:blue")
+        ax.axhline(0, color="black", lw=0.8, ls="--")
+        ax.set_xlabel("Średni Kaitz w kwantylu (p.p.)")
+        ax.set_ylabel("Efekt vs najniższy kwantyl (p.p.)")
+        ax.set_title("Kwantyle Kaitza (TWFE)")
+        fig_show(fig)
+    with c2:
+        cv = quad["curve"]
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.fill_between(cv["Kaitz"], cv["lo"], cv["hi"], color="tab:blue", alpha=0.2)
+        ax.plot(cv["Kaitz"], cv["fit"], color="tab:blue", lw=2)
+        ax.axhline(0, color="black", lw=0.8, ls="--")
+        ax.set_xlabel("Kaitz (p.p.)")
+        ax.set_ylabel("Efekt względem średniego Kaitza (p.p.)")
+        ax.set_title(f"Model kwadratowy (p członu² = {quad['p_quad']:.3f})")
+        fig_show(fig)
+    with c3:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        tb = thr["table"]
+        ax.plot(tb["węzeł (p.p. Kaitza)"], tb["F"], marker="o", ms=3)
+        ax.axvline(thr["best_knot"], color="tab:red", ls="--", label=f"najlepszy węzeł: {thr['best_knot']:.1f} p.p.")
+        ax.set_xlabel("Węzeł załamania (p.p. Kaitza)")
+        ax.set_ylabel("Statystyka F załamania")
+        ax.set_title(f"Skan progu (sup-F p = {thr['p_boot']:.3f})")
+        ax.legend(fontsize=8)
+        fig_show(fig)
+    st.dataframe(dose.round(3), use_container_width=True)
+    msg = (f"Model z jednym załamaniem: nachylenie poniżej węzła {thr['best_knot']:.1f} p.p. = {thr['slope_below']:.2f}, "
+           f"powyżej = {thr['slope_above']:.2f}. Test sup-F (dzikie bootstrap klastrów, B = {thr['B']}): p = {thr['p_boot']:.3f}.")
+    (st.success if thr["p_boot"] < 0.05 else st.info)(
+        msg + (" Dane wspierają istnienie progu." if thr["p_boot"] < 0.05 else
+               " Brak statystycznego wsparcia dla progu – nieliniowość z Causal Forest należy traktować ostrożnie."))
+    if np.isfinite(quad["turning"]):
+        st.caption(f"Punkt zwrotny paraboli: {quad['turning']:.1f} p.p. ("
+                   f"{'wewnątrz' if quad['inside'] else 'poza'} obserwowanego zakresu).")
+    if cres is None:
+        st.info("Wykresy z Causal Forest pojawią się po poprawnym uruchomieniu analizy (wymagany econml).")
+        return
+    d, xcols = cres["sample"], cres["xcols"]
+    sur = cres.get("surfaces")
+    st.markdown("### 2. Mapy CATE: interakcje moderatorów keynesowskich")
+    if sur and sur["pairs"]:
+        pairs = list(sur["pairs"].items())
+        for i in range(0, len(pairs), 3):
+            cols = st.columns(3)
+            for cc, ((ca, cb), (ga, gb, Z)) in zip(cols, pairs[i:i + 3]):
+                with cc:
+                    fig, ax = plt.subplots(figsize=(5, 4.2))
+                    plot_surface(ax, ga, gb, Z, short_label(ca), short_label(cb),
+                                 f"CATE: {short_label(ca)} × {short_label(cb)}", d[ca], d[cb])
+                    fig_show(fig)
+        st.caption("Pozostałe moderatory ustawione na medianie; linia przerywana = CATE równy 0; punkty = obserwacje "
+                   "(poza zakresem danych powierzchnia jest ekstrapolacją lasu).")
+    else:
+        st.caption("Powierzchnie CATE niedostępne w tym przebiegu.")
+    st.markdown("### 3. Profile częściowej zależności (PDP) i krzywe ICE")
+    if sur and sur["pdp"]:
+        items = list(sur["pdp"].items())
+        for i in range(0, len(items), 3):
+            cols = st.columns(3)
+            for cc, (c, (g, ice, pdp)) in zip(cols, items[i:i + 3]):
+                with cc:
+                    fig, ax = plt.subplots(figsize=(5, 3.8))
+                    plot_pdp_ice(ax, g, ice, pdp, label_of(c), d[c])
+                    ax.set_title(short_label(c), fontsize=10)
+                    fig_show(fig)
+    st.markdown("### 4. Geografia efektów: kartogram województw")
+    years = sorted(d["Rok"].unique())
+    yr = st.select_slider("Rok", options=years, value=years[-1])
+    m1 = d.groupby("Kod_Str")["tau"].mean().to_dict()
+    m2 = d[d["Rok"] == yr].groupby("Kod_Str")["tau"].mean().to_dict()
+    vlim = (min(d["tau"].min(), -1e-6), max(d["tau"].max(), 1e-6))
+    m = max(abs(vlim[0]), abs(vlim[1]))
+    cA, cB = st.columns(2)
+    with cA:
+        fig, ax = plt.subplots(figsize=(5.2, 4.6))
+        plot_tile_map(ax, m1, "Średni CATE 2010–2024", vlim=(-m, m))
+        fig_show(fig)
+    with cB:
+        fig, ax = plt.subplots(figsize=(5.2, 4.6))
+        plot_tile_map(ax, m2, f"CATE w roku {yr}", vlim=(-m, m))
+        fig_show(fig)
+    cC, cD = st.columns(2)
+    with cC:
+        bite = panel.groupby("Kod_Str")["Kaitz_pp"].mean().to_dict()
+        fig, ax = plt.subplots(figsize=(5.2, 4.6))
+        plot_tile_map(ax, bite, "Średni Kaitz (p.p.)", cmap="viridis", symmetric=False, fmt="{:.1f}")
+        fig_show(fig)
+    with cD:
+        unemp = panel.groupby("Kod_Str")["Bezrobocie_BAEL"].mean().to_dict()
+        fig, ax = plt.subplots(figsize=(5.2, 4.6))
+        plot_tile_map(ax, unemp, "Średnie bezrobocie (%)", cmap="magma_r", symmetric=False, fmt="{:.1f}")
+        fig_show(fig)
+    hm = cate_region_year(d)
+    fig, ax = plt.subplots(figsize=(11, 5))
+    mm = max(abs(hm.min().min()), abs(hm.max().max()), 1e-9)
+    sns.heatmap(hm, cmap="RdBu", center=0, vmin=-mm, vmax=mm, ax=ax, cbar_kws={"label": "CATE (p.p.)"})
+    ax.set_title("CATE wg województw i lat (posortowane od najsilniej ujemnych)")
+    ax.set_ylabel("")
+    fig_show(fig)
+    st.markdown("### 5. Krzyż keynesowski: faza cyklu × rezerwy rynku pracy")
+    try:
+        mean, cnt, cyc, res_ = keynes_cross(d, xcols)
+        fig, ax = plt.subplots(figsize=(5.8, 4))
+        mx = max(abs(np.nanmin(mean.values)), abs(np.nanmax(mean.values)), 1e-9)
+        sns.heatmap(mean, annot=True, fmt=".2f", cmap="RdBu", center=0, vmin=-mx, vmax=mx, ax=ax,
+                    cbar_kws={"label": "średni CATE (p.p.)"})
+        for (i, j), v in np.ndenumerate(cnt.values):
+            ax.text(j + 0.5, i + 0.78, f"n={int(v)}", ha="center", va="center", fontsize=8, color="dimgrey")
+        ax.set_xlabel(f"Rezerwy pracy: {short_label(res_)} (terciele)")
+        ax.set_ylabel(f"Cykl: {short_label(cyc)} (terciele)")
+        ax.set_title("Hipoteza keynesowska: czy popyt amortyzuje efekt?")
+        fig_show(fig)
+        st.caption("Oczekiwanie keynesowskie: efekt mniej ujemny przy wysokim wzroście PKB i wysokim bezrobociu (duże rezerwy pracy).")
+    except Exception as e:
+        st.caption(f"Tabela krzyżowa niedostępna: {type(e).__name__}")
+    keyn = [c for c in xcols if c.split("_L1")[0] in KEYNES_COLS]
+    fig, axes = plt.subplots(1, len(keyn), figsize=(5 * len(keyn), 3.8), sharey=True)
+    for ax, c in zip(np.atleast_1d(axes), keyn):
+        t = pd.DataFrame({"g": tercile_labels(d[c]), "tau": d["tau"]})
+        sns.boxplot(data=t, x="g", y="tau", ax=ax, color="lightsteelblue", fliersize=2)
+        ax.axhline(0, color="black", lw=0.8, ls="--")
+        ax.set_xlabel(short_label(c) + " (terciele)")
+        ax.set_ylabel("CATE")
+    fig.tight_layout()
+    fig_show(fig)
+
+
+def render_shap_extras(cres, sh, X_df, sv):
+    """Dodatkowe wykresy SHAP: interakcje, SHAP wg województw, wykresy zależności, wodospad dla obserwacji."""
+    d = cres["sample"]
+    names = list(X_df.columns)
+    st.markdown("### Interakcje i geografia SHAP")
+    c1, c2 = st.columns(2)
+    with c1:
+        inter = sh.get("interaction")
+        if inter is not None and getattr(inter, "ndim", 0) == 3:
+            M = np.abs(inter).mean(axis=0)
+            fig, ax = plt.subplots(figsize=(6, 4.8))
+            sns.heatmap(pd.DataFrame(M, index=names, columns=names), annot=True, fmt=".3f", cmap="Blues", ax=ax,
+                        cbar_kws={"label": "średnia |interakcja SHAP|"})
+            ax.set_title("Macierz interakcji moderatorów")
+            fig_show(fig)
+        else:
+            st.caption("Interakcje SHAP niedostępne dla tego modelu zastępczego.")
+    with c2:
+        hm = shap_region_feature(sv, d, names)
+        fig, ax = plt.subplots(figsize=(6, 4.8))
+        mm = max(abs(hm.values.min()), abs(hm.values.max()), 1e-9)
+        sns.heatmap(hm.loc[hm.sum(axis=1).sort_values().index], cmap="RdBu", center=0, vmin=-mm, vmax=mm, ax=ax,
+                    cbar_kws={"label": "średni SHAP"})
+        ax.set_ylabel("")
+        ax.set_title("Co napędza efekt w danym województwie")
+        fig_show(fig)
+    st.markdown("**Zależność SHAP z kolorem drugiej cechy (efekt interakcji)**")
+    keyn = [c for c in cres["xcols"] if c.split("_L1")[0] in KEYNES_COLS]
+    cols = st.columns(len(keyn))
+    for cc, c in zip(cols, keyn):
+        with cc:
+            try:
+                plt.figure(figsize=(5, 4))
+                shap.dependence_plot(short_label(c), sv, X_df, show=False, interaction_index="auto")
+                fig_show(plt.gcf())
+            except Exception as e:
+                st.caption(f"dependence_plot niedostępny: {type(e).__name__}")
+    st.markdown("**Rozkład efektu dla wybranego województwa i roku (wodospad SHAP)**")
+    idx = st.selectbox("Obserwacja", options=list(range(len(d))),
+                       format_func=lambda i: f"{d['Wojewodztwo'].iloc[i]} {int(d['Rok'].iloc[i])}", key="wf_idx")
+    try:
+        exp = shap.Explanation(values=sv[idx], base_values=sh["base"], data=X_df.iloc[idx].to_numpy(), feature_names=names)
+        plt.figure(figsize=(7, 4))
+        shap.plots.waterfall(exp, show=False)
+        fig_show(plt.gcf())
+    except Exception as e:
+        st.caption(f"Wodospad niedostępny: {type(e).__name__}")
 def main():
     st.set_page_config(page_title="Magisterka - Płaca Minimalna", layout="wide")
     st.title("Heterogeniczny wpływ płacy minimalnej na zatrudnienie")
@@ -1513,13 +1960,14 @@ def main():
         lag = st.checkbox("Moderatory opóźnione o rok (zalecane)", value=True)
         treat_lab = st.selectbox("Treatment", ["Kaitz rzeczywisty (regionalny)", "Kaitz ekspozycyjny (przedsamplowy)"])
         fe_demean = st.checkbox("Oczyść Y i T z FE woj. i lat przed DML", value=True)
+        bite = st.checkbox("Dodaj przeciętny Kaitz województwa jako modyfikator (progi)", value=True)
         n_trees = st.select_slider("Liczba drzew w lesie", options=[200, 500, 1000, 2000], value=1000)
         min_leaf = st.slider("Minimalna liczebność liścia", 3, 15, 5)
         B = st.select_slider("Replikacje bootstrapu klastrów", options=[199, 499, 999, 1999], value=499)
         seed = st.number_input("Ziarno losowe", 0, 9999, 42)
         native = st.checkbox("Spróbuj także natywnych SHAP z EconML", value=False)
     treat = "Kaitz_pp" if treat_lab.startswith("Kaitz rzeczywisty") else "Kaitz_Ekspozycja_pp"
-    cfg = {"treat": treat, "lag": bool(lag), "fe_demean": bool(fe_demean), "n_trees": int(n_trees),
+    cfg = {"treat": treat, "lag": bool(lag), "fe_demean": bool(fe_demean), "bite": bool(bite), "n_trees": int(n_trees),
            "min_leaf": int(min_leaf), "seed": int(seed), "native_shap": bool(native)}
     run_analysis = st.sidebar.button("Uruchom Pełną Analizę")
 
@@ -1558,7 +2006,8 @@ def main():
         st.error("Część Causal ML nie została wykonana: " + st.session_state["cres_err"])
 
     tabs = st.tabs(["📊 Dane & EDA", "📈 Modele Liniowe (Baseline)", "🌲 Causal Machine Learning",
-                    "🔍 Heterogeniczność (SHAP)", "🛡️ Testy odporności", "💾 Eksport"])
+                    "🔍 Heterogeniczność (SHAP)", "🧭 Nieliniowość i mapy", "🛡️ Testy odporności",
+                    "💾 Eksport"])
     with tabs[0]:
         render_data(panel, diag, origin, sources)
     with tabs[1]:
@@ -1568,8 +2017,10 @@ def main():
     with tabs[3]:
         render_shap(cres)
     with tabs[4]:
-        render_robust(lin, panel, st.session_state.get("cfg", cfg))
+        render_nonlinear(lin, cres, panel)
     with tabs[5]:
+        render_robust(lin, panel, st.session_state.get("cfg", cfg))
+    with tabs[6]:
         render_export(panel, lin, cres)
     if lin is None:
         st.info("Naciśnij przycisk po lewej stronie, aby rozpocząć proces Causal ML.")
